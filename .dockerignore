@@ -1,0 +1,40 @@
+# Git
+.git
+.gitignore
+.github
+
+# Build artifacts
+target/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+*~
+
+# Documentation
+*.md
+CLAUDE.md
+FEATURE-ROADMAP.md
+TUTORIALS.md
+
+# Test files
+test-*.sh
+*.jsonl
+diagnostic.jsonl
+
+# Logs
+*.log
+log/
+
+# Config examples
+*-config.toml
+llama-*.toml
+
+# Temporary files
+*.tmp
+*.temp
+.DS_Store

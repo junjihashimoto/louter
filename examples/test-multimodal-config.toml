@@ -1,0 +1,66 @@
+# Test config for multimodal routing with EXPLICIT FALLBACK
+# =====================================================
+# EXPLICIT FALLBACK BEHAVIOR:
+# - gpt-oss backend: text-only, fallback → gemma3 for vision requests
+# - gemma3 backend: multimodal (text + vision) via LM Studio
+# - qwen3 backend: text-only (needs mmproj for vision)
+#
+# ROUTING LOGIC:
+# 1. Request "gpt-oss" with text → uses gpt-oss backend
+# 2. Request "gpt-oss" with image → gpt-oss falls back to gemma3
+# 3. Request "gemma3" with text → uses gemma3 backend
+# 4. Request "gemma3" with image → uses gemma3 backend
+# =====================================================
+
+[performance]
+enable_metrics = true
+log_requests = true
+timeout_seconds = 120
+
+# Text-only backend (gpt-oss on port 11211)
+[backends.gpt-oss]
+url = "http://localhost:11211"
+protocol = "openai"  # Uses OpenAI-compatible API (llama.cpp)
+capabilities = ["text"]  # EXPLICIT: Only accepts text requests
+priority = 1  # Higher priority for text-only requests
+fallback = "gemma3"  # ⭐ Falls back to gemma3 when vision is needed
+max_tokens = 4096
+temperature = 0.7
+
+[backends.gpt-oss.model_mapping]
+"gpt-oss-20b" = "gpt-oss:20b"
+"gpt-oss" = "gpt-oss:20b"
+"gemma3" = "gpt-oss:20b"  # Also accepts gemma3 model names
+"qwen3-coder" = "gpt-oss:20b"
+"qwen3" = "gpt-oss:20b"
+
+# Multimodal backend (gemma3 via LM Studio on port 1234)
+[backends.gemma3]
+url = "http://localhost:1234"
+protocol = "openai"  # Uses OpenAI-compatible API (LM Studio)
+capabilities = ["text", "vision"]  # EXPLICIT: Accepts text AND vision
+priority = 2  # Higher priority for vision
+max_tokens = 4096
+temperature = 0.7
+
+[backends.gemma3.model_mapping]
+"gemma3" = "gemma-3"
+"gemma-3" = "gemma-3"
+"gpt-oss-20b" = "gemma-3"
+"gpt-oss" = "gemma-3"
+"qwen3-coder" = "gemma-3"
+"qwen3" = "gemma-3"
+
+# Text-only backend (qwen3 on port 11212 - needs mmproj for vision)
+[backends.qwen3]
+url = "http://localhost:11212"
+protocol = "openai"  # Uses OpenAI-compatible API (llama.cpp)
+capabilities = ["text"]  # Text-only (needs mmproj file for vision support)
+priority = 3  # Lower priority
+max_tokens = 4096
+temperature = 0.7
+tool_format = "xml"  # Qwen3 uses XML format for tools
+
+[backends.qwen3.model_mapping]
+"qwen3-coder" = "Qwen3-Coder-30B-A3B-Instruct"
+"qwen3" = "Qwen3-Coder-30B-A3B-Instruct"

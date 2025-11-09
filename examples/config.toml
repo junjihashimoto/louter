@@ -1,0 +1,54 @@
+# Louter (LLM Router) Configuration
+# This file configures the proxy to convert Gemini API requests to OpenAI API calls
+
+# Custom instructions to prepend to all requests
+custom_instructions = "You are a helpful assistant. Please provide accurate and helpful responses."
+
+# Performance and monitoring configuration
+[performance]
+enable_metrics = true
+log_requests = true
+timeout_seconds = 30
+# OpenAI token counting mode: "estimate" (fast, free) or "chat" (accurate, uses API)
+openai_token_counting_mode = "chat"
+
+# Backend configuration
+[backends.openai]
+url = "https://api.openai.com"
+max_tokens = 4096
+temperature = 0.7
+weight = 1.0
+# api_key = "your-openai-api-key-here"  # Uncomment and set to override OPENAI_API_KEY env var
+
+# Model mappings from Gemini model names to OpenAI model names
+[backends.openai.model_mapping]
+"gemini-2.0-flash" = "gpt-4"
+"gemini-pro" = "gpt-3.5-turbo"
+"gemini-1.5-pro" = "gpt-4"
+"gemini-1.5-flash" = "gpt-4o-mini"
+
+# Gemini backend for pass-through mode
+[backends.gemini]
+url = "https://generativelanguage.googleapis.com"
+max_tokens = 8192
+temperature = 0.7
+weight = 1.0
+# api_key = "your-gemini-api-key-here"  # Uncomment and set to override GEMINI_API_KEY env var
+
+# Model mappings for Gemini (pass-through - no conversion)
+[backends.gemini.model_mapping]
+"gemini-2.0-flash" = "gemini-2.0-flash"
+"gemini-pro" = "gemini-pro"
+"gemini-1.5-pro" = "gemini-1.5-pro"
+"gemini-1.5-flash" = "gemini-1.5-flash"
+
+# Example additional backend (commented out)
+# [backends.openai_backup]
+# url = "https://api.openai.com"
+# max_tokens = 4096
+# temperature = 0.7
+# weight = 0.5
+# 
+# [backends.openai_backup.model_mapping]
+# "gemini-2.0-flash" = "gpt-4"
+# "gemini-pro" = "gpt-3.5-turbo"

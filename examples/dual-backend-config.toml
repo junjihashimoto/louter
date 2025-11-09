@@ -1,0 +1,37 @@
+# Louter (LLM Router) Configuration - Dual Backend (gpt-oss + Qwen3-Coder)
+# Supports both JSON and XML tool calling formats
+
+custom_instructions = "You are a helpful assistant."
+verbose = true
+
+[performance]
+enable_metrics = true
+log_requests = true
+timeout_seconds = 60
+openai_token_counting_mode = "estimate"
+
+# Backend 1: gpt-oss (JSON tool format)
+[backends.gpt-oss]
+url = "http://localhost:11211"
+max_tokens = 32768
+temperature = 0.7
+weight = 1.0
+tool_format = "json"  # gpt-oss uses standard JSON format
+
+[backends.gpt-oss.model_mapping]
+"gpt-oss-20b" = "gpt-oss:20b"
+"gemini-2.0-flash" = "gpt-oss:20b"
+"gemini-flash" = "gpt-oss:20b"
+
+# Backend 2: Qwen3-Coder (XML tool format)
+[backends.qwen]
+url = "http://localhost:11212"
+max_tokens = 65536
+temperature = 0.7
+weight = 1.0
+tool_format = "xml"  # Qwen3-Coder outputs XML format tool calls
+
+[backends.qwen.model_mapping]
+"qwen3-coder" = "Qwen3-Coder-30B-A3B-Instruct"
+"gemini-1.5-pro" = "Qwen3-Coder-30B-A3B-Instruct"
+"gemini-pro" = "Qwen3-Coder-30B-A3B-Instruct"

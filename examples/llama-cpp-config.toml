@@ -1,0 +1,86 @@
+# Louter (LLM Router) Configuration
+# This file configures the proxy to convert Gemini API requests to OpenAI API calls
+
+# Custom instructions to prepend to all requests
+# custom_instructions = "You are a helpful assistant. Please provide accurate and helpful responses."
+verbose = true
+
+# Performance and monitoring configuration
+[performance]
+enable_metrics = true
+log_requests = true
+timeout_seconds = 120  # Increased from 30 to handle large requests
+# OpenAI token counting mode: "estimate" (fast, free) or "chat" (accurate, uses API)
+openai_token_counting_mode = "chat"
+
+# Tool filtering for smaller models (helps with complex function calling)
+# Available tools from gemini-cli: list_directory, read_file, search_file_content, glob, web_fetch, read_many_files, save_memory, google_web_search
+# Disabled filtering to allow all tools (including write_file if present)
+# allowed_tools = ["list_directory", "read_file", "save_memory"]
+
+# Override system instruction to reduce context size
+#override_system_instruction = "You are a helpful CLI assistant. When you need to use a tool, respond with a JSON function call in this exact format: {\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}."
+
+# Limit conversation history to prevent error accumulation (keeps only last N messages)
+# max_conversation_turns = 2
+
+# Backend configuration
+[backends.openai]
+url = "http://localhost:11211"
+max_tokens = 32768
+temperature = 0.7
+weight = 1.0
+# api_key = "your-openai-api-key-here"  # Uncomment and set to override OPENAI_API_KEY env var
+
+# Capabilities this backend supports (for automatic routing)
+# Options: "text", "vision", "audio", "video", "function_calling"
+# Leave empty or omit for AUTO MODE (accepts all request types)
+# capabilities = []  # AUTO MODE: accepts all types (default)
+capabilities = ["text", "function_calling"]  # Explicit mode: only text and function calling
+
+# Priority for backend selection (lower number = higher priority)
+# When multiple backends support the same capabilities, lower priority number is preferred
+# Text-only requests will prefer this backend (cheaper/faster)
+priority = 1
+
+# Per-backend custom instruction (optional)
+# custom_instruction = "You are a helpful coding assistant. Always provide clear, concise answers."
+# custom_instruction_mode = "append"  # Options: "override", "prepend", "append" (default: "append")
+#   - "override": Replace the client's system instruction entirely
+#   - "prepend": Add custom instruction before the client's system instruction
+#   - "append": Add custom instruction after the client's system instruction (default)
+
+# Model mappings from Gemini model names to OpenAI model names
+[backends.openai.model_mapping]
+"gpt-oss-20b" = "gpt-oss:20b"
+"gemma3-4b" = "gemma3:4b"
+"gemini-2.0-flash" = "gemma3:4b"
+"gemini-pro" = "gemma3:4b"
+"gemini-1.5-pro" = "gemma3:4b"
+"gemini-1.5-flash" = "gemma3:4b"
+
+# Gemini backend for pass-through mode
+[backends.gemini]
+url = "http://localhost:1111"
+max_tokens = 32768
+temperature = 0.7
+weight = 1.0
+# api_key = "your-gemini-api-key-here"  # Uncomment and set to override GEMINI_API_KEY env var
+
+# Capabilities this backend supports (for automatic routing)
+# Options: "text", "vision", "audio", "video", "function_calling"
+# Leave empty or omit for AUTO MODE (accepts all request types)
+# capabilities = []  # AUTO MODE: accepts all types (default)
+capabilities = ["text", "vision", "audio", "function_calling"]  # Explicit mode
+
+# Priority for backend selection (lower number = higher priority)
+# Vision/audio requests will route to this backend (only one with those capabilities)
+priority = 2
+
+# Per-backend custom instruction for Gemini (optional)
+# custom_instruction = "Focus on providing detailed technical explanations."
+# custom_instruction_mode = "append"
+
+# Model mappings for Gemini (pass-through - no conversion)
+[backends.gemini.model_mapping]
+"gpt-oss-20b" = "gpt-oss-20b"

@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Louter (LLM Router) - Debug Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            line-height: 1.6;
+        }
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+        header {
+            background: #1e293b;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+        h1 { color: #60a5fa; font-size: 24px; margin-bottom: 5px; }
+        .subtitle { color: #94a3b8; font-size: 14px; }
+
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        .tab {
+            padding: 12px 24px;
+            background: #1e293b;
+            border: none;
+            border-radius: 8px 8px 0 0;
+            color: #94a3b8;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+        .tab:hover { background: #334155; color: #e2e8f0; }
+        .tab.active { background: #3b82f6; color: white; }
+
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
+        .panel {
+            background: #1e293b;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+
+        .controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+            flex-wrap: wrap;
+        }
+        input, select, button {
+            padding: 10px 16px;
+            border-radius: 6px;
+            border: 1px solid #334155;
+            background: #0f172a;
+            color: #e2e8f0;
+            font-size: 14px;
+        }
+        input:focus, select:focus {
+            outline: none;
+            border-color: #3b82f6;
+        }
+        button {
+            background: #3b82f6;
+            border: none;
+            cursor: pointer;
+            font-weight: 500;
+            transition: background 0.2s;
+        }
+        button:hover { background: #2563eb; }
+        button.secondary { background: #475569; }
+        button.secondary:hover { background: #64748b; }
+
+        .log-entry {
+            background: #0f172a;
+            border-left: 4px solid #3b82f6;
+            padding: 15px;
+            margin-bottom: 10px;
+            border-radius: 4px;
+            font-size: 13px;
+        }
+        .log-entry.client_request { border-left-color: #10b981; }
+        .log-entry.backend_request { border-left-color: #f59e0b; }
+        .log-entry.backend_response { border-left-color: #f59e0b; }
+        .log-entry.client_response { border-left-color: #10b981; }
+
+        .log-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+            font-weight: 500;
+        }
+        .log-direction {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .log-direction.client_request { background: #10b981; color: white; }
+        .log-direction.backend_request { background: #f59e0b; color: white; }
+        .log-direction.backend_response { background: #f97316; color: white; }
+        .log-direction.client_response { background: #06b6d4; color: white; }
+
+        .log-timestamp { color: #64748b; font-size: 12px; }
+        .log-endpoint { color: #94a3b8; font-size: 12px; margin-bottom: 8px; }
+        .log-metrics {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-bottom: 8px;
+        }
+        .metric-badge {
+            display: inline-block;
+            padding: 3px 8px;
+            background: #1e3a8a;
+            color: #93c5fd;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 500;
+            font-family: 'Monaco', 'Courier New', monospace;
+        }
+        .log-payload {
+            background: #020617;
+            padding: 10px;
+            border-radius: 4px;
+            overflow-x: auto;
+            font-family: 'Monaco', 'Courier New', monospace;
+            font-size: 12px;
+            line-height: 1.5;
+            color: #cbd5e1;
+            text-align: left;
+        }
+
+        .metric-item {
+            background: #0f172a;
+            padding: 12px;
+            margin-bottom: 8px;
+            border-radius: 4px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 13px;
+        }
+        .metric-name {
+            font-weight: 500;
+            color: #60a5fa;
+            font-family: 'Monaco', 'Courier New', monospace;
+        }
+        .metric-value {
+            font-weight: 600;
+            color: #10b981;
+            font-size: 16px;
+        }
+        .metric-labels {
+            color: #94a3b8;
+            font-size: 11px;
+            margin-top: 4px;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .stat-card {
+            background: #1e293b;
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+        }
+        .stat-value {
+            font-size: 32px;
+            font-weight: 700;
+            color: #60a5fa;
+            margin-bottom: 5px;
+        }
+        .stat-label {
+            color: #94a3b8;
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .error { color: #ef4444; background: #7f1d1d; padding: 15px; border-radius: 6px; margin-bottom: 15px; }
+        .loading { text-align: center; padding: 40px; color: #94a3b8; }
+        .empty { text-align: center; padding: 40px; color: #64748b; }
+
+        pre { white-space: pre-wrap; word-wrap: break-word; text-align: left; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🚀 Louter (LLM Router) Debug Dashboard</h1>
+            <div class="subtitle">Real-time logs and metrics monitoring</div>
+        </header>
+
+        <div class="tabs">
+            <button class="tab active" onclick="switchTab('logs')">📋 Logs</button>
+            <button class="tab" onclick="switchTab('metrics')">📊 Metrics</button>
+        </div>
+
+        <!-- Logs Tab -->
+        <div id="logs-tab" class="tab-content active">
+            <div class="panel">
+                <h2 style="margin-bottom: 15px; color: #60a5fa; font-size: 18px;">Request/Response Logs</h2>
+
+                <div class="controls">
+                    <select id="direction-filter">
+                        <option value="">All Directions</option>
+                        <option value="client_request">Client Request</option>
+                        <option value="backend_request">Backend Request</option>
+                        <option value="backend_response">Backend Response</option>
+                        <option value="client_response">Client Response</option>
+                    </select>
+
+                    <input type="text" id="search-input" placeholder="Search logs..." style="flex: 1; min-width: 200px;">
+
+                    <select id="limit-select">
+                        <option value="50">50 logs</option>
+                        <option value="100" selected>100 logs</option>
+                        <option value="200">200 logs</option>
+                        <option value="500">500 logs</option>
+                    </select>
+
+                    <button onclick="loadLogs()">🔄 Refresh</button>
+                    <button class="secondary" onclick="clearLogs()">🗑️ Clear View</button>
+                </div>
+
+                <div id="logs-container" class="loading">Loading logs...</div>
+            </div>
+        </div>
+
+        <!-- Metrics Tab -->
+        <div id="metrics-tab" class="tab-content">
+            <div class="stats" id="stats-container"></div>
+
+            <div class="panel">
+                <h2 style="margin-bottom: 15px; color: #60a5fa; font-size: 18px;">Prometheus Metrics</h2>
+
+                <div class="controls">
+                    <input type="text" id="metrics-search" placeholder="Filter metrics..." style="flex: 1;">
+                    <button onclick="loadMetrics()">🔄 Refresh</button>
+                </div>
+
+                <div id="metrics-container" class="loading">Loading metrics...</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentTab = 'logs';
+        let autoRefresh = null;
+
+        function switchTab(tab) {
+            currentTab = tab;
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            document.querySelector(`button.tab:nth-child(${tab === 'logs' ? 1 : 2})`).classList.add('active');
+            document.getElementById(`${tab}-tab`).classList.add('active');
+
+            if (tab === 'logs') {
+                loadLogs();
+            } else {
+                loadMetrics();
+            }
+        }
+
+        async function loadLogs() {
+            const direction = document.getElementById('direction-filter').value;
+            const search = document.getElementById('search-input').value;
+            const limit = document.getElementById('limit-select').value;
+
+            const params = new URLSearchParams();
+            if (direction) params.append('direction', direction);
+            if (search) params.append('search', search);
+            params.append('limit', limit);
+
+            try {
+                const response = await fetch(`/api/logs?${params}`);
+                const data = await response.json();
+
+                const container = document.getElementById('logs-container');
+
+                if (!data.success) {
+                    container.innerHTML = `<div class="error">❌ ${data.error}</div>`;
+                    return;
+                }
+
+                if (data.logs.length === 0) {
+                    container.innerHTML = '<div class="empty">No logs found. Make sure the proxy was started with --log-file flag.</div>';
+                    return;
+                }
+
+                container.innerHTML = data.logs.map(log => {
+                    const metricsHtml = (log.e2e_latency_ms || log.tps || log.ttft_ms) ? `
+                        <div class="log-metrics">
+                            ${log.e2e_latency_ms ? `<span class="metric-badge">⏱️ ${log.e2e_latency_ms.toFixed(2)}ms</span>` : ''}
+                            ${log.ttft_ms ? `<span class="metric-badge">🚀 TTFT: ${log.ttft_ms.toFixed(2)}ms</span>` : ''}
+                            ${log.tps ? `<span class="metric-badge">⚡ ${log.tps.toFixed(2)} tok/s</span>` : ''}
+                            ${log.itl_ms !== null && log.itl_ms !== undefined ? `<span class="metric-badge">📊 ITL: ${log.itl_ms.toFixed(2)}ms</span>` : ''}
+                            ${log.output_tokens ? `<span class="metric-badge">📤 ${log.output_tokens} out</span>` : ''}
+                            ${log.input_tokens ? `<span class="metric-badge">📥 ${log.input_tokens} in</span>` : ''}
+                        </div>
+                    ` : '';
+
+                    return `
+                        <div class="log-entry ${log.direction}">
+                            <div class="log-header">
+                                <span class="log-direction ${log.direction}">${log.direction}</span>
+                                <span class="log-timestamp">${log.timestamp}</span>
+                            </div>
+                            <div class="log-endpoint">
+                                <strong>${log.format}</strong> → ${log.endpoint}
+                            </div>
+                            ${metricsHtml}
+                            <div class="log-payload">
+                                <pre>${JSON.stringify(log.payload, null, 2)}</pre>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+            } catch (error) {
+                document.getElementById('logs-container').innerHTML =
+                    `<div class="error">❌ Failed to load logs: ${error.message}</div>`;
+            }
+        }
+
+        async function loadMetrics() {
+            try {
+                const response = await fetch('/api/metrics');
+                const data = await response.json();
+
+                if (!data.success) {
+                    document.getElementById('metrics-container').innerHTML =
+                        `<div class="error">❌ ${data.error}</div>`;
+                    return;
+                }
+
+                // Calculate stats
+                const stats = calculateStats(data.metrics);
+                displayStats(stats);
+
+                // Display metrics
+                const searchTerm = document.getElementById('metrics-search').value.toLowerCase();
+                const filteredMetrics = data.metrics.filter(m =>
+                    m.name.toLowerCase().includes(searchTerm)
+                );
+
+                const container = document.getElementById('metrics-container');
+                if (filteredMetrics.length === 0) {
+                    container.innerHTML = '<div class="empty">No metrics found</div>';
+                    return;
+                }
+
+                container.innerHTML = filteredMetrics.map(metric => `
+                    <div class="metric-item">
+                        <div>
+                            <div class="metric-name">${metric.name}</div>
+                            ${metric.labels ? `<div class="metric-labels">${metric.labels}</div>` : ''}
+                        </div>
+                        <div class="metric-value">${metric.value}</div>
+                    </div>
+                `).join('');
+            } catch (error) {
+                document.getElementById('metrics-container').innerHTML =
+                    `<div class="error">❌ Failed to load metrics: ${error.message}</div>`;
+            }
+        }
+
+        function calculateStats(metrics) {
+            const stats = {
+                totalRequests: 0,
+                errors: 0,
+                tokens: 0,
+                functionCalls: 0
+            };
+
+            metrics.forEach(metric => {
+                if (metric.name === 'http_requests_total') {
+                    stats.totalRequests += metric.value;
+                }
+                if (metric.name === 'errors_total') {
+                    stats.errors += metric.value;
+                }
+                if (metric.name === 'tokens_total') {
+                    stats.tokens += metric.value;
+                }
+                if (metric.name === 'function_calls_total') {
+                    stats.functionCalls += metric.value;
+                }
+            });
+
+            return stats;
+        }
+
+        function displayStats(stats) {
+            const container = document.getElementById('stats-container');
+            container.innerHTML = `
+                <div class="stat-card">
+                    <div class="stat-value">${stats.totalRequests}</div>
+                    <div class="stat-label">Total Requests</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">${stats.tokens}</div>
+                    <div class="stat-label">Total Tokens</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">${stats.functionCalls}</div>
+                    <div class="stat-label">Function Calls</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">${stats.errors}</div>
+                    <div class="stat-label">Errors</div>
+                </div>
+            `;
+        }
+
+        function clearLogs() {
+            document.getElementById('logs-container').innerHTML =
+                '<div class="empty">Logs cleared. Click Refresh to reload.</div>';
+        }
+
+        // Auto-refresh every 5 seconds
+        setInterval(() => {
+            if (currentTab === 'logs') {
+                loadLogs();
+            } else {
+                loadMetrics();
+            }
+        }, 5000);
+
+        // Initial load
+        loadLogs();
+    </script>
+</body>
+</html>

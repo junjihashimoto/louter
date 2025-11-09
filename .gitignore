@@ -1,0 +1,50 @@
+# Rust build outputs
+/target/
+Cargo.lock
+
+# IDE and editor files
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+
+# Logs and temporary files
+*.log
+*.tmp
+/tmp/
+log/
+*.jsonl
+
+# Test artifacts
+test_count_tokens.json
+create_test_media.py
+test-phase*.sh
+touch.yaml
+write_file.json
+local.sh
+*.txt
+
+# Environment and secrets
+.env
+.env.local
+*.key
+
+# User config files (keep examples/ tracked, ignore root configs)
+/config.toml
+/config-*.toml
+
+# Debug files
+*.pdb
+*.dSYM/
+
+# OS specific
+Thumbs.db
+desktop.ini
+
+# Python cache (for test scripts)
+__pycache__/
+*.py[cod]
+*.pyo
