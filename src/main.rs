@@ -156,6 +156,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         // OpenAI API routes
         .route("/v1/chat/completions", post(handle_openai_chat_completions))
+        // Anthropic (Claude) API routes
+        .route("/v1/messages", post(handle_anthropic_messages))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -1125,6 +1127,132 @@ async fn handle_openai_chat_completions(
         _ => {
             Err(ProxyError::ConfigError(format!("Unsupported backend type: {}", state.backend_type)))
         }
+    }
+}
+
+// Anthropic (Claude) API endpoint
+async fn handle_anthropic_messages(
+    State(state): State<AppState>,
+    _headers: HeaderMap,
+    Json(request): Json<louter::models::anthropic::MessagesRequest>,
+) -> Result<Response, ProxyError> {
+    let start_time = Instant::now();
+    let original_model = request.model.clone();
+
+    info!("Anthropic messages request for model: {}", request.model);
+    debug!("Anthropic request body: {}", serde_json::to_string_pretty(&request).unwrap_or_else(|e| format!("Failed to serialize request: {}", e)));
+
+    // Log client request
+    if let Some(logger) = &state.logger {
+        if let Ok(request_json) = serde_json::to_value(&request) {
+            logger.log_client_request("/v1/messages", "anthropic", &request_json);
+        }
+    }
+
+    // Content-based routing: Detect required capabilities
+    let required_caps: std::collections::HashSet<_> = if request.tools.is_some() {
+        vec![routing::Capability::FunctionCalling].into_iter().collect()
+    } else {
+        vec![routing::Capability::Text].into_iter().collect()
+    };
+    let required_caps_str: Vec<_> = required_caps.iter()
+        .map(|c| c.as_str())
+        .collect();
+
+    info!("📋 Request requires capabilities: [{}]", required_caps_str.join(", "));
+
+    // Route to appropriate backend
+    let selected_backend = match routing::select_backend_for_request(&required_caps, &state.config) {
+        Ok((backend_name, backend_config)) => {
+            let mode = if backend_config.capabilities.is_empty() { "AUTO (accepts all)" } else { "EXPLICIT" };
+            info!("✓ Routing selected: '{}' (mode: {}, url: {}, priority: {})",
+                backend_name, mode, backend_config.url, backend_config.priority);
+            metrics::record_routing_decision(&backend_name, &required_caps_str, "capability", true);
+            backend_name
+        },
+        Err(e) => {
+            warn!("⚠ Routing failed: {}", e);
+            info!("→ Falling back to command-line backend: {}", state.backend_type);
+            metrics::record_routing_decision("none", &required_caps_str, "failed", false);
+            state.backend_type.clone()
+        }
+    };
+
+    // Convert Anthropic request to OpenAI format
+    let openai_request = conversion::anthropic_to_openai_request(request.clone(), &selected_backend, &state.config)?;
+
+    // Get API key for selected backend
+    let openai_api_key = state.config.get_api_key(&selected_backend, "OPENAI_API_KEY")
+        .ok_or_else(|| ProxyError::ConfigError(format!("API key not found for backend '{}' in config or OPENAI_API_KEY environment variable", selected_backend)))?;
+
+    // Log backend request
+    if let Some(logger) = &state.logger {
+        if let Ok(request_json) = serde_json::to_value(&openai_request) {
+            logger.log_backend_request("/v1/chat/completions", "openai", &request_json);
+        }
+    }
+
+    let is_streaming = request.stream.unwrap_or(false);
+
+    if is_streaming {
+        // Streaming mode
+        let stream = state.backend_client.chat_completion_stream(&selected_backend, openai_request, &openai_api_key).await?;
+
+        // Convert OpenAI stream to Anthropic SSE format
+        let anthropic_stream = conversion::openai_stream_to_anthropic_sse(stream, &original_model);
+        Ok(axum::response::Sse::new(anthropic_stream).into_response())
+    } else {
+        // Non-streaming mode
+        let openai_response = state.backend_client.chat_completion(&selected_backend, openai_request, &openai_api_key).await?;
+
+        // Log backend response
+        if let Some(logger) = &state.logger {
+            if let Ok(response_json) = serde_json::to_value(&openai_response) {
+                logger.log_backend_response("/v1/chat/completions", "openai", &response_json);
+            }
+        }
+
+        // Convert OpenAI response to Anthropic format
+        let anthropic_response = conversion::openai_to_anthropic_response(openai_response.clone(), &original_model)?;
+
+        // Calculate metrics
+        let e2e_latency_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+        let output_tokens = openai_response.usage.completion_tokens;
+        let input_tokens = Some(openai_response.usage.prompt_tokens);
+        let ttft_ms = Some(e2e_latency_ms);
+
+        // Log client response with metrics
+        if let Some(logger) = &state.logger {
+            if let Ok(response_json) = serde_json::to_value(&anthropic_response) {
+                logger.log_client_response_with_metrics(
+                    "/v1/messages",
+                    "anthropic",
+                    &response_json,
+                    ttft_ms,
+                    Some(e2e_latency_ms),
+                    Some(output_tokens),
+                    input_tokens,
+                );
+            }
+        }
+
+        // Print metrics if verbose
+        if state.verbose {
+            info!("Metrics: e2e={:.2}ms, output_tokens={}, input_tokens={:?}",
+                e2e_latency_ms, output_tokens, input_tokens);
+        }
+
+        // Record performance metrics to Prometheus
+        let ttft_seconds = ttft_ms.map(|ms| ms / 1000.0);
+        let tps_value = Some(output_tokens as f64 / (e2e_latency_ms / 1000.0));
+        let itl_seconds = Some(if output_tokens > 1 {
+            e2e_latency_ms / (output_tokens as f64 - 1.0) / 1000.0
+        } else {
+            0.0
+        });
+        metrics::record_performance_metrics("/v1/messages", "anthropic", ttft_seconds, tps_value, itl_seconds);
+
+        Ok(Json(anthropic_response).into_response())
     }
 }
 

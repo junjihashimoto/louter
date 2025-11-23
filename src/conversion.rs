@@ -1302,3 +1302,518 @@ pub fn extract_and_convert_xml_tool_calls(content: &str) -> (String, Vec<openai:
 
     (cleaned_text, tool_calls)
 }
+
+// ============================================================================
+// Anthropic (Claude) API Conversion Functions
+// ============================================================================
+
+use crate::models::anthropic::{self as anthropic};
+
+/// Convert Anthropic API request to OpenAI format
+/// This allows Claude API clients to use OpenAI backends
+pub fn anthropic_to_openai_request(
+    anthropic_request: anthropic::MessagesRequest,
+    backend_name: &str,
+    config: &Config,
+) -> Result<OpenAIRequest, ProxyError> {
+    let _backend_config = config
+        .get_backend(backend_name)
+        .ok_or_else(|| ProxyError::ConfigError(format!("Backend '{}' not configured", backend_name)))?;
+
+    // Map model name through config
+    let openai_model = config
+        .map_model(backend_name, &anthropic_request.model)
+        .unwrap_or_else(|| anthropic_request.model.clone());
+
+    let mut messages = Vec::new();
+
+    // Convert system prompt to OpenAI format
+    if let Some(system) = &anthropic_request.system {
+        let system_text = match system {
+            anthropic::SystemPrompt::Text(text) => text.clone(),
+            anthropic::SystemPrompt::Blocks(blocks) => {
+                blocks.iter()
+                    .map(|block| block.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            }
+        };
+
+        if !system_text.is_empty() {
+            messages.push(Message::System {
+                role: "system".to_string(),
+                content: system_text,
+            });
+        }
+    }
+
+    // Convert messages
+    for msg in &anthropic_request.messages {
+        match &msg.content {
+            anthropic::MessageContent::Text(text) => {
+                messages.push(Message::User {
+                    role: msg.role.clone(),
+                    content: MessageContent::Text(text.clone()),
+                });
+            }
+            anthropic::MessageContent::Blocks(blocks) => {
+                // Check if this is a tool result message
+                let has_tool_result = blocks.iter().any(|block| {
+                    matches!(block, anthropic::ContentBlock::ToolResult { .. })
+                });
+
+                if has_tool_result && msg.role == "user" {
+                    // Handle tool results - convert to OpenAI tool message format
+                    for block in blocks {
+                        if let anthropic::ContentBlock::ToolResult { tool_use_id, content } = block {
+                            let result_text = match content {
+                                Some(anthropic::ToolResultContent::Text(text)) => text.clone(),
+                                Some(anthropic::ToolResultContent::Blocks(content_blocks)) => {
+                                    content_blocks.iter()
+                                        .filter_map(|cb| {
+                                            if let anthropic::ContentBlock::Text { text } = cb {
+                                                Some(text.as_str())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                }
+                                None => String::new(),
+                            };
+
+                            messages.push(Message::Tool {
+                                role: "tool".to_string(),
+                                content: result_text,
+                                tool_call_id: tool_use_id.clone(),
+                            });
+                        }
+                    }
+                } else {
+                    // Regular message with multiple content blocks
+                    let mut text_parts = Vec::new();
+                    let mut tool_calls = Vec::new();
+
+                    for block in blocks {
+                        match block {
+                            anthropic::ContentBlock::Text { text } => {
+                                text_parts.push(text.clone());
+                            }
+                            anthropic::ContentBlock::Image { source } => {
+                                // OpenAI doesn't support images in the same way
+                                // For now, just add a placeholder text
+                                text_parts.push(format!("[Image: {} {}]", source.media_type, source.r#type));
+                            }
+                            anthropic::ContentBlock::ToolUse { id, name, input } => {
+                                // Convert to OpenAI tool call
+                                tool_calls.push(openai::ToolCall {
+                                    id: id.clone(),
+                                    tool_type: "function".to_string(),
+                                    function: openai::FunctionCall {
+                                        name: name.clone(),
+                                        arguments: serde_json::to_string(input)
+                                            .unwrap_or_else(|_| "{}".to_string()),
+                                    },
+                                });
+                            }
+                            anthropic::ContentBlock::ToolResult { .. } => {
+                                // Already handled above
+                            }
+                        }
+                    }
+
+                    if msg.role == "assistant" && !tool_calls.is_empty() {
+                        messages.push(Message::Assistant {
+                            role: "assistant".to_string(),
+                            content: Some(text_parts.join("\n")),
+                            tool_calls: Some(tool_calls),
+                        });
+                    } else {
+                        messages.push(Message::User {
+                            role: msg.role.clone(),
+                            content: MessageContent::Text(text_parts.join("\n")),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Cap max_tokens for OpenAI models (16384 limit)
+    let max_tokens = anthropic_request.max_tokens.min(16384);
+
+    // Convert tools to OpenAI format
+    let tools = anthropic_request.tools.as_ref().map(|anthropic_tools| {
+        anthropic_tools.iter().map(|tool| {
+            openai::Tool {
+                tool_type: "function".to_string(),
+                function: openai::Function {
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    parameters: Some(tool.input_schema.clone()),
+                },
+            }
+        }).collect()
+    });
+
+    // Convert tool_choice to OpenAI format
+    let tool_choice = anthropic_request.tool_choice.as_ref().map(|choice| {
+        match choice {
+            anthropic::ToolChoice::Auto => openai::ToolChoice::String("auto".to_string()),
+            anthropic::ToolChoice::Any => openai::ToolChoice::String("required".to_string()),
+            anthropic::ToolChoice::Tool { name } => {
+                openai::ToolChoice::Object {
+                    r#type: "function".to_string(),
+                    function: openai::FunctionChoice { name: name.clone() }
+                }
+            }
+        }
+    });
+
+    Ok(OpenAIRequest {
+        model: openai_model,
+        messages,
+        temperature: anthropic_request.temperature.map(|t| t as f64),
+        top_p: anthropic_request.top_p.map(|t| t as f64),
+        max_tokens: Some(max_tokens),
+        max_completion_tokens: None,
+        stream: anthropic_request.stream,
+        stop: anthropic_request.stop_sequences.clone(),
+        tools,
+        tool_choice,
+        presence_penalty: None,
+        frequency_penalty: None,
+        logit_bias: None,
+        n: None,
+        user: None,
+    })
+}
+
+/// Convert OpenAI response to Anthropic format
+pub fn openai_to_anthropic_response(
+    openai_response: OpenAIResponse,
+    original_model: &str,
+) -> Result<anthropic::MessagesResponse, ProxyError> {
+    let choice = openai_response.choices.get(0)
+        .ok_or_else(|| ProxyError::ConversionError("No choices in OpenAI response".to_string()))?;
+
+    let mut content = Vec::new();
+
+    // Add text content if present
+    if let Some(ref text) = choice.message.content {
+        if !text.is_empty() {
+            content.push(anthropic::ResponseContentBlock::Text {
+                text: text.clone(),
+            });
+        }
+    }
+
+    // Add tool calls if present
+    if let Some(ref tool_calls) = choice.message.tool_calls {
+        for tool_call in tool_calls {
+            let input: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
+                .unwrap_or_else(|_| serde_json::json!({}));
+
+            content.push(anthropic::ResponseContentBlock::ToolUse {
+                id: tool_call.id.clone(),
+                name: tool_call.function.name.clone(),
+                input,
+            });
+        }
+    }
+
+    // If content is empty, add empty text block
+    if content.is_empty() {
+        content.push(anthropic::ResponseContentBlock::Text {
+            text: String::new(),
+        });
+    }
+
+    // Map finish_reason to stop_reason
+    let stop_reason = match choice.finish_reason.as_deref() {
+        Some("stop") => Some("end_turn".to_string()),
+        Some("length") => Some("max_tokens".to_string()),
+        Some("tool_calls") => Some("tool_use".to_string()),
+        Some("stop_sequence") => Some("stop_sequence".to_string()),
+        _ => Some("end_turn".to_string()),
+    };
+
+    Ok(anthropic::MessagesResponse {
+        id: openai_response.id,
+        r#type: "message".to_string(),
+        role: "assistant".to_string(),
+        content,
+        model: original_model.to_string(),
+        stop_reason,
+        stop_sequence: None,
+        usage: anthropic::Usage {
+            input_tokens: openai_response.usage.prompt_tokens,
+            output_tokens: openai_response.usage.completion_tokens,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        },
+    })
+}
+
+/// Convert OpenAI streaming response to Anthropic SSE format
+pub fn openai_stream_to_anthropic_sse(
+    stream: Pin<Box<dyn Stream<Item = Result<openai::OpenAIStreamResponse, ProxyError>> + Send>>,
+    original_model: &str,
+) -> impl Stream<Item = Result<Event, ProxyError>> {
+    use futures_util::stream;
+    use uuid::Uuid;
+
+    let model = original_model.to_string();
+    let message_id = format!("msg_{}", Uuid::new_v4().simple());
+
+    // State to track the stream
+    struct StreamState {
+        message_id: String,
+        model: String,
+        first_chunk: bool,
+        text_block_started: bool,
+        text_block_closed: bool,
+        tool_calls_started: bool,
+        accumulated_text: String,
+        tool_call_index: usize,
+        output_tokens: i32,
+        stream_ended: bool,
+    }
+
+    let initial_state = StreamState {
+        message_id: message_id.clone(),
+        model,
+        first_chunk: true,
+        text_block_started: false,
+        text_block_closed: false,
+        tool_calls_started: false,
+        accumulated_text: String::new(),
+        tool_call_index: 0,
+        output_tokens: 0,
+        stream_ended: false,
+    };
+
+    stream::unfold(
+        (stream, initial_state),
+        |(mut stream, mut state)| async move {
+            // If stream has ended, stop
+            if state.stream_ended {
+                return None;
+            }
+
+            // Send initial message_start event
+            if state.first_chunk {
+                state.first_chunk = false;
+
+                let message_start = anthropic::StreamEvent::MessageStart {
+                    message: anthropic::MessageStartData {
+                        id: state.message_id.clone(),
+                        r#type: "message".to_string(),
+                        role: "assistant".to_string(),
+                        content: vec![],
+                        model: state.model.clone(),
+                        stop_reason: None,
+                        stop_sequence: None,
+                        usage: anthropic::Usage {
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            cache_creation_input_tokens: None,
+                            cache_read_input_tokens: None,
+                        },
+                    },
+                };
+
+                let event = Event::default()
+                    .event("message_start")
+                    .json_data(message_start)
+                    .unwrap();
+
+                return Some((Ok(event), (stream, state)));
+            }
+
+            // Get next chunk from OpenAI stream
+            match stream.next().await {
+                Some(Ok(openai_chunk)) => {
+                    // Process OpenAIStreamResponse
+                    if let Some(choice) = openai_chunk.choices.get(0) {
+                        let delta = &choice.delta;
+                        let finish_reason = choice.finish_reason.as_deref();
+
+                            // Handle text content
+                            if let Some(content) = &delta.content {
+                                if !content.is_empty() {
+                                    // Start text block if not started
+                                    if !state.text_block_started {
+                                        state.text_block_started = true;
+
+                                        let block_start = anthropic::StreamEvent::ContentBlockStart {
+                                            index: 0,
+                                            content_block: anthropic::StreamContentBlock::Text {
+                                                text: String::new(),
+                                            },
+                                        };
+
+                                        let event = Event::default()
+                                            .event("content_block_start")
+                                            .json_data(block_start)
+                                            .unwrap();
+
+                                        return Some((Ok(event), (stream, state)));
+                                    }
+
+                                    // Send text delta
+                                    state.accumulated_text.push_str(content);
+
+                                    let delta_event = anthropic::StreamEvent::ContentBlockDelta {
+                                        index: 0,
+                                        delta: anthropic::Delta::TextDelta {
+                                            text: content.clone(),
+                                        },
+                                    };
+
+                                    let event = Event::default()
+                                        .event("content_block_delta")
+                                        .json_data(delta_event)
+                                        .unwrap();
+
+                                    return Some((Ok(event), (stream, state)));
+                                }
+                            }
+
+                            // Handle tool calls
+                            if let Some(tool_calls) = &delta.tool_calls {
+                                for tool_call in tool_calls {
+                                    // Close text block if open
+                                    if state.text_block_started && !state.text_block_closed {
+                                        state.text_block_closed = true;
+
+                                        let block_stop = anthropic::StreamEvent::ContentBlockStop { index: 0 };
+                                        let event = Event::default()
+                                            .event("content_block_stop")
+                                            .json_data(block_stop)
+                                            .unwrap();
+
+                                        return Some((Ok(event), (stream, state)));
+                                    }
+
+                                    let function = &tool_call.function;
+                                    let name = function.name.as_deref().unwrap_or("");
+                                    let id = tool_call.id.as_deref().unwrap_or("");
+
+                                    if !state.tool_calls_started {
+                                        state.tool_calls_started = true;
+                                        state.tool_call_index += 1;
+
+                                        let tool_start = anthropic::StreamEvent::ContentBlockStart {
+                                            index: state.tool_call_index,
+                                            content_block: anthropic::StreamContentBlock::ToolUse {
+                                                id: id.to_string(),
+                                                name: name.to_string(),
+                                                input: serde_json::json!({}),
+                                            },
+                                        };
+
+                                        let event = Event::default()
+                                            .event("content_block_start")
+                                            .json_data(tool_start)
+                                            .unwrap();
+
+                                        return Some((Ok(event), (stream, state)));
+                                    }
+
+                                    // Send tool arguments as delta
+                                    let args = &function.arguments;
+                                    if !args.is_empty() {
+                                        let delta_event = anthropic::StreamEvent::ContentBlockDelta {
+                                            index: state.tool_call_index,
+                                            delta: anthropic::Delta::InputJsonDelta {
+                                                partial_json: args.clone(),
+                                            },
+                                        };
+
+                                        let event = Event::default()
+                                            .event("content_block_delta")
+                                            .json_data(delta_event)
+                                            .unwrap();
+
+                                        return Some((Ok(event), (stream, state)));
+                                    }
+                                }
+                            }
+
+                            // Handle finish_reason
+                            if let Some(reason) = finish_reason {
+                                // Close any open blocks
+                                if state.text_block_started && !state.text_block_closed {
+                                    state.text_block_closed = true;
+
+                                    let block_stop = anthropic::StreamEvent::ContentBlockStop { index: 0 };
+                                    let event = Event::default()
+                                        .event("content_block_stop")
+                                        .json_data(block_stop)
+                                        .unwrap();
+
+                                    return Some((Ok(event), (stream, state)));
+                                }
+
+                                if state.tool_calls_started {
+                                    let block_stop = anthropic::StreamEvent::ContentBlockStop {
+                                        index: state.tool_call_index,
+                                    };
+                                    let event = Event::default()
+                                        .event("content_block_stop")
+                                        .json_data(block_stop)
+                                        .unwrap();
+
+                                    return Some((Ok(event), (stream, state)));
+                                }
+
+                                // Map finish_reason to stop_reason
+                                let stop_reason = match reason {
+                                    "stop" => "end_turn",
+                                    "length" => "max_tokens",
+                                    "tool_calls" => "tool_use",
+                                    _ => "end_turn",
+                                };
+
+                                let message_delta = anthropic::StreamEvent::MessageDelta {
+                                    delta: anthropic::MessageDeltaData {
+                                        stop_reason: Some(stop_reason.to_string()),
+                                        stop_sequence: None,
+                                    },
+                                    usage: anthropic::OutputUsage {
+                                        output_tokens: state.output_tokens,
+                                    },
+                                };
+
+                                let event = Event::default()
+                                    .event("message_delta")
+                                    .json_data(message_delta)
+                                    .unwrap();
+
+                                return Some((Ok(event), (stream, state)));
+                            }
+                    }
+
+                    // Return ping event for chunks without processable data
+                    Some((Ok(Event::default().event("ping").data("{\"type\":\"ping\"}")), (stream, state)))
+                }
+                Some(Err(e)) => {
+                    Some((Err(ProxyError::ConversionError(format!("Stream error: {}", e))), (stream, state)))
+                }
+                None => {
+                    // Stream ended - send final message_stop
+                    state.stream_ended = true;
+
+                    let event = Event::default()
+                        .event("message_stop")
+                        .json_data(anthropic::StreamEvent::MessageStop)
+                        .unwrap();
+
+                    Some((Ok(event), (stream, state)))
+                }
+            }
+        },
+    )
+}
