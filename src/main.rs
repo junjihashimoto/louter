@@ -1196,7 +1196,10 @@ async fn handle_anthropic_messages(
 
     if is_streaming {
         // Streaming mode
-        let stream = state.backend_client.chat_completion_stream(&selected_backend, openai_request, &openai_api_key).await?;
+        let mut streaming_request = openai_request;
+        streaming_request.stream = Some(true);
+
+        let stream = state.backend_client.chat_completion_stream(&selected_backend, streaming_request, &openai_api_key).await?;
 
         // Convert OpenAI stream to Anthropic SSE format
         let anthropic_stream = conversion::openai_stream_to_anthropic_sse(stream, &original_model);

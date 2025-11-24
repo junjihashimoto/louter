@@ -1574,12 +1574,16 @@ pub fn openai_stream_to_anthropic_sse(
         first_chunk: bool,
         text_block_started: bool,
         text_block_closed: bool,
+        text_block_index: Option<usize>,  // Index of text block if started
         tool_calls_started: bool,
+        tool_block_index: Option<usize>,  // Index of current tool block if started
         accumulated_text: String,
-        tool_call_index: usize,
+        next_content_index: usize,  // Next available content block index
+        tool_call_id: Option<String>,  // Accumulate tool call ID from chunks
+        tool_call_name: Option<String>,  // Accumulate tool call name from chunks
+        tool_call_arguments_buffer: String,  // Buffer for tool call arguments from first chunk
         output_tokens: i32,
         stream_ended: bool,
-        sent_done: bool,  // Track if we sent [DONE] marker
         sent_message_delta: bool,  // Track if we sent message_delta
         pending_text_delta: Option<String>,  // Buffer first delta after block_start
     }
@@ -1590,12 +1594,16 @@ pub fn openai_stream_to_anthropic_sse(
         first_chunk: true,
         text_block_started: false,
         text_block_closed: false,
+        text_block_index: None,
         tool_calls_started: false,
+        tool_block_index: None,
         accumulated_text: String::new(),
-        tool_call_index: 0,
+        next_content_index: 0,
+        tool_call_id: None,
+        tool_call_name: None,
+        tool_call_arguments_buffer: String::new(),
         output_tokens: 0,
         stream_ended: false,
-        sent_done: false,
         sent_message_delta: false,
         pending_text_delta: None,
     };
@@ -1634,25 +1642,6 @@ pub fn openai_stream_to_anthropic_sse(
                 return Some((Ok(event), (stream, state)));
             }
 
-            // Send content_block_start immediately after message_start
-            if !state.text_block_started {
-                state.text_block_started = true;
-
-                let block_start = anthropic::StreamEvent::ContentBlockStart {
-                    index: 0,
-                    content_block: anthropic::StreamContentBlock::Text {
-                        text: String::new(),
-                    },
-                };
-
-                let event = Event::default()
-                    .event("content_block_start")
-                    .json_data(block_start)
-                    .unwrap();
-
-                return Some((Ok(event), (stream, state)));
-            }
-
             // Get next chunk from OpenAI stream
             match stream.next().await {
                 Some(Ok(openai_chunk)) => {
@@ -1664,11 +1653,36 @@ pub fn openai_stream_to_anthropic_sse(
                             // Handle text content (ONLY content, ignore reasoning_content)
                             if let Some(content) = &delta.content {
                                 if !content.is_empty() {
-                                    // Send text delta (block_start was already sent upfront)
+                                    // Send content_block_start if this is the first text content
+                                    if !state.text_block_started {
+                                        state.text_block_started = true;
+                                        let text_block_index = state.next_content_index;
+                                        state.text_block_index = Some(text_block_index);
+                                        state.next_content_index += 1;
+
+                                        let block_start = anthropic::StreamEvent::ContentBlockStart {
+                                            index: text_block_index,
+                                            content_block: anthropic::StreamContentBlock::Text {
+                                                text: String::new(),
+                                            },
+                                        };
+
+                                        let event = Event::default()
+                                            .event("content_block_start")
+                                            .json_data(block_start)
+                                            .unwrap();
+
+                                        return Some((Ok(event), (stream, state)));
+                                    }
+
+                                    // Send text delta
                                     state.accumulated_text.push_str(content);
 
+                                    // Use the stored text block index
+                                    let text_index = state.text_block_index.unwrap();
+
                                     let delta_event = anthropic::StreamEvent::ContentBlockDelta {
-                                        index: 0,
+                                        index: text_index,
                                         delta: anthropic::Delta::TextDelta {
                                             text: content.clone(),
                                         },
@@ -1690,7 +1704,8 @@ pub fn openai_stream_to_anthropic_sse(
                                     if state.text_block_started && !state.text_block_closed {
                                         state.text_block_closed = true;
 
-                                        let block_stop = anthropic::StreamEvent::ContentBlockStop { index: 0 };
+                                        let text_index = state.text_block_index.unwrap();
+                                        let block_stop = anthropic::StreamEvent::ContentBlockStop { index: text_index };
                                         let event = Event::default()
                                             .event("content_block_stop")
                                             .json_data(block_stop)
@@ -1699,19 +1714,43 @@ pub fn openai_stream_to_anthropic_sse(
                                         return Some((Ok(event), (stream, state)));
                                     }
 
-                                    let function = &tool_call.function;
-                                    let name = function.name.as_deref().unwrap_or("");
-                                    let id = tool_call.id.as_deref().unwrap_or("");
+                                    // Accumulate tool call id and name from chunks
+                                    if let Some(id) = &tool_call.id {
+                                        if !id.is_empty() && state.tool_call_id.is_none() {
+                                            state.tool_call_id = Some(id.clone());
+                                        }
+                                    }
 
+                                    let function = &tool_call.function;
+                                    if let Some(name) = &function.name {
+                                        if !name.is_empty() && state.tool_call_name.is_none() {
+                                            state.tool_call_name = Some(name.clone());
+                                        }
+                                    }
+
+                                    // Accumulate arguments into buffer before tool_calls_started
                                     if !state.tool_calls_started {
+                                        let args = &function.arguments;
+                                        if !args.is_empty() {
+                                            state.tool_call_arguments_buffer.push_str(args);
+                                        }
+                                    }
+
+                                    // Only send content_block_start when we have both id and name
+                                    if !state.tool_calls_started
+                                        && state.tool_call_id.is_some()
+                                        && state.tool_call_name.is_some() {
+
                                         state.tool_calls_started = true;
-                                        state.tool_call_index += 1;
+                                        let tool_block_index = state.next_content_index;
+                                        state.tool_block_index = Some(tool_block_index);
+                                        state.next_content_index += 1;
 
                                         let tool_start = anthropic::StreamEvent::ContentBlockStart {
-                                            index: state.tool_call_index,
+                                            index: tool_block_index,
                                             content_block: anthropic::StreamContentBlock::ToolUse {
-                                                id: id.to_string(),
-                                                name: name.to_string(),
+                                                id: state.tool_call_id.clone().unwrap(),
+                                                name: state.tool_call_name.clone().unwrap(),
                                                 input: serde_json::json!({}),
                                             },
                                         };
@@ -1724,22 +1763,53 @@ pub fn openai_stream_to_anthropic_sse(
                                         return Some((Ok(event), (stream, state)));
                                     }
 
-                                    // Send tool arguments as delta
-                                    let args = &function.arguments;
-                                    if !args.is_empty() {
-                                        let delta_event = anthropic::StreamEvent::ContentBlockDelta {
-                                            index: state.tool_call_index,
-                                            delta: anthropic::Delta::InputJsonDelta {
-                                                partial_json: args.clone(),
-                                            },
-                                        };
+                                    // Send tool arguments as delta (only if tool_calls_started)
+                                    if state.tool_calls_started {
+                                        // First, send any buffered arguments from before content_block_start
+                                        if !state.tool_call_arguments_buffer.is_empty() {
+                                            let tool_index = state.tool_block_index.unwrap();
+                                            let buffered_args = state.tool_call_arguments_buffer.clone();
+                                            state.tool_call_arguments_buffer.clear();
 
-                                        let event = Event::default()
-                                            .event("content_block_delta")
-                                            .json_data(delta_event)
-                                            .unwrap();
+                                            // Also append current chunk's arguments to buffer for next iteration
+                                            let args = &function.arguments;
+                                            if !args.is_empty() {
+                                                state.tool_call_arguments_buffer.push_str(args);
+                                            }
 
-                                        return Some((Ok(event), (stream, state)));
+                                            let delta_event = anthropic::StreamEvent::ContentBlockDelta {
+                                                index: tool_index,
+                                                delta: anthropic::Delta::InputJsonDelta {
+                                                    partial_json: buffered_args,
+                                                },
+                                            };
+
+                                            let event = Event::default()
+                                                .event("content_block_delta")
+                                                .json_data(delta_event)
+                                                .unwrap();
+
+                                            return Some((Ok(event), (stream, state)));
+                                        }
+
+                                        // Send current chunk's arguments
+                                        let args = &function.arguments;
+                                        if !args.is_empty() {
+                                            let tool_index = state.tool_block_index.unwrap();
+                                            let delta_event = anthropic::StreamEvent::ContentBlockDelta {
+                                                index: tool_index,
+                                                delta: anthropic::Delta::InputJsonDelta {
+                                                    partial_json: args.clone(),
+                                                },
+                                            };
+
+                                            let event = Event::default()
+                                                .event("content_block_delta")
+                                                .json_data(delta_event)
+                                                .unwrap();
+
+                                            return Some((Ok(event), (stream, state)));
+                                        }
                                     }
                                 }
                             }
@@ -1750,7 +1820,8 @@ pub fn openai_stream_to_anthropic_sse(
                                 if state.text_block_started && !state.text_block_closed {
                                     state.text_block_closed = true;
 
-                                    let block_stop = anthropic::StreamEvent::ContentBlockStop { index: 0 };
+                                    let text_index = state.text_block_index.unwrap();
+                                    let block_stop = anthropic::StreamEvent::ContentBlockStop { index: text_index };
                                     let event = Event::default()
                                         .event("content_block_stop")
                                         .json_data(block_stop)
@@ -1760,8 +1831,9 @@ pub fn openai_stream_to_anthropic_sse(
                                 }
 
                                 if state.tool_calls_started {
+                                    let tool_index = state.tool_block_index.unwrap();
                                     let block_stop = anthropic::StreamEvent::ContentBlockStop {
-                                        index: state.tool_call_index,
+                                        index: tool_index,
                                     };
                                     let event = Event::default()
                                         .event("content_block_stop")
@@ -1843,17 +1915,7 @@ pub fn openai_stream_to_anthropic_sse(
                         return Some((Ok(event), (stream, state)));
                     }
 
-                    // Send [DONE] marker if not sent yet
-                    if !state.sent_done {
-                        state.sent_done = true;
-
-                        let event = Event::default()
-                            .data("[DONE]");
-
-                        return Some((Ok(event), (stream, state)));
-                    }
-
-                    // All done, end stream
+                    // All done, end stream (no [DONE] marker per Claude API spec)
                     None
                 }
             }
