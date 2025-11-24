@@ -20,3 +20,5 @@ max_tokens_field = "max_tokens"  # llama.cpp uses the older field
 
 [backends.gpt-oss.model_mapping]
 "gpt-oss" = "gpt-oss:20b"
+"claude-sonnet-4-5-20250929" = "gpt-oss:20b"
+"claude-haiku-4-5-20251001" = "gpt-oss:20b"

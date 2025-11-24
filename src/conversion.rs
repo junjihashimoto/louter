@@ -1550,8 +1550,8 @@ pub fn openai_to_anthropic_response(
         usage: anthropic::Usage {
             input_tokens: openai_response.usage.prompt_tokens,
             output_tokens: openai_response.usage.completion_tokens,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
+            cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: Some(0),
         },
     })
 }
@@ -1579,6 +1579,9 @@ pub fn openai_stream_to_anthropic_sse(
         tool_call_index: usize,
         output_tokens: i32,
         stream_ended: bool,
+        sent_done: bool,  // Track if we sent [DONE] marker
+        sent_message_delta: bool,  // Track if we sent message_delta
+        pending_text_delta: Option<String>,  // Buffer first delta after block_start
     }
 
     let initial_state = StreamState {
@@ -1592,15 +1595,14 @@ pub fn openai_stream_to_anthropic_sse(
         tool_call_index: 0,
         output_tokens: 0,
         stream_ended: false,
+        sent_done: false,
+        sent_message_delta: false,
+        pending_text_delta: None,
     };
 
     stream::unfold(
         (stream, initial_state),
         |(mut stream, mut state)| async move {
-            // If stream has ended, stop
-            if state.stream_ended {
-                return None;
-            }
 
             // Send initial message_start event
             if state.first_chunk {
@@ -1618,8 +1620,8 @@ pub fn openai_stream_to_anthropic_sse(
                         usage: anthropic::Usage {
                             input_tokens: 0,
                             output_tokens: 0,
-                            cache_creation_input_tokens: None,
-                            cache_read_input_tokens: None,
+                            cache_creation_input_tokens: Some(0),
+                            cache_read_input_tokens: Some(0),
                         },
                     },
                 };
@@ -1627,6 +1629,25 @@ pub fn openai_stream_to_anthropic_sse(
                 let event = Event::default()
                     .event("message_start")
                     .json_data(message_start)
+                    .unwrap();
+
+                return Some((Ok(event), (stream, state)));
+            }
+
+            // Send content_block_start immediately after message_start
+            if !state.text_block_started {
+                state.text_block_started = true;
+
+                let block_start = anthropic::StreamEvent::ContentBlockStart {
+                    index: 0,
+                    content_block: anthropic::StreamContentBlock::Text {
+                        text: String::new(),
+                    },
+                };
+
+                let event = Event::default()
+                    .event("content_block_start")
+                    .json_data(block_start)
                     .unwrap();
 
                 return Some((Ok(event), (stream, state)));
@@ -1640,29 +1661,10 @@ pub fn openai_stream_to_anthropic_sse(
                         let delta = &choice.delta;
                         let finish_reason = choice.finish_reason.as_deref();
 
-                            // Handle text content
+                            // Handle text content (ONLY content, ignore reasoning_content)
                             if let Some(content) = &delta.content {
                                 if !content.is_empty() {
-                                    // Start text block if not started
-                                    if !state.text_block_started {
-                                        state.text_block_started = true;
-
-                                        let block_start = anthropic::StreamEvent::ContentBlockStart {
-                                            index: 0,
-                                            content_block: anthropic::StreamContentBlock::Text {
-                                                text: String::new(),
-                                            },
-                                        };
-
-                                        let event = Event::default()
-                                            .event("content_block_start")
-                                            .json_data(block_start)
-                                            .unwrap();
-
-                                        return Some((Ok(event), (stream, state)));
-                                    }
-
-                                    // Send text delta
+                                    // Send text delta (block_start was already sent upfront)
                                     state.accumulated_text.push_str(content);
 
                                     let delta_event = anthropic::StreamEvent::ContentBlockDelta {
@@ -1777,6 +1779,8 @@ pub fn openai_stream_to_anthropic_sse(
                                     _ => "end_turn",
                                 };
 
+                                state.sent_message_delta = true;
+
                                 let message_delta = anthropic::StreamEvent::MessageDelta {
                                     delta: anthropic::MessageDeltaData {
                                         stop_reason: Some(stop_reason.to_string()),
@@ -1803,15 +1807,54 @@ pub fn openai_stream_to_anthropic_sse(
                     Some((Err(ProxyError::ConversionError(format!("Stream error: {}", e))), (stream, state)))
                 }
                 None => {
-                    // Stream ended - send final message_stop
-                    state.stream_ended = true;
+                    // Stream ended - send message_delta, message_stop, and [DONE] in sequence
 
-                    let event = Event::default()
-                        .event("message_stop")
-                        .json_data(anthropic::StreamEvent::MessageStop)
-                        .unwrap();
+                    // Send message_delta if not sent yet
+                    if !state.sent_message_delta {
+                        state.sent_message_delta = true;
 
-                    Some((Ok(event), (stream, state)))
+                        let message_delta = anthropic::StreamEvent::MessageDelta {
+                            delta: anthropic::MessageDeltaData {
+                                stop_reason: Some("end_turn".to_string()),
+                                stop_sequence: None,
+                            },
+                            usage: anthropic::OutputUsage {
+                                output_tokens: state.output_tokens,
+                            },
+                        };
+
+                        let event = Event::default()
+                            .event("message_delta")
+                            .json_data(message_delta)
+                            .unwrap();
+
+                        return Some((Ok(event), (stream, state)));
+                    }
+
+                    // Send message_stop if not sent yet
+                    if !state.stream_ended {
+                        state.stream_ended = true;
+
+                        let event = Event::default()
+                            .event("message_stop")
+                            .json_data(anthropic::StreamEvent::MessageStop)
+                            .unwrap();
+
+                        return Some((Ok(event), (stream, state)));
+                    }
+
+                    // Send [DONE] marker if not sent yet
+                    if !state.sent_done {
+                        state.sent_done = true;
+
+                        let event = Event::default()
+                            .data("[DONE]");
+
+                        return Some((Ok(event), (stream, state)));
+                    }
+
+                    // All done, end stream
+                    None
                 }
             }
         },
