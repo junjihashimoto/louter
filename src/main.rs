@@ -1071,7 +1071,7 @@ async fn handle_openai_chat_completions(
             }
         },
         "gemini" => {
-            // Gemini backend: Convert OpenAI request to Gemini format
+            // Gemini backend: Convert OpenAI request to Gemini format using IR converters
             // Use selected_backend for API key lookup (supports routing)
             let gemini_api_key = state.config.get_api_key(&selected_backend, "GEMINI_API_KEY")
                 .ok_or_else(|| ProxyError::ConfigError(format!("API key not found for backend '{}' in config or GEMINI_API_KEY environment variable", selected_backend)))?;
@@ -1080,8 +1080,21 @@ async fn handle_openai_chat_completions(
             let gemini_model = state.config.map_model("gemini", &request.model)
                 .unwrap_or_else(|| "gemini-2.0-flash".to_string());
 
-            // Convert OpenAI request to Gemini format
-            let gemini_request = conversion::openai_to_gemini_request(request.clone(), &gemini_model, &state.config)?;
+            // Create converters
+            let frontend_converter = louter::ir::converters::openai_frontend::OpenAIFrontendConverter::new();
+            let backend_converter = louter::ir::converters::gemini_backend::GeminiBackendConverter::new();
+
+            // Serialize OpenAI request
+            let request_bytes = serde_json::to_vec(&request)?;
+
+            // Parse OpenAI request to IR
+            let ir_request = frontend_converter.parse_request(&request_bytes).await?;
+
+            // Format IR to Gemini request
+            let gemini_request_bytes = backend_converter.format_request(&ir_request).await?;
+
+            // Deserialize Gemini request
+            let gemini_request: louter::models::gemini::GeminiRequest = serde_json::from_slice(&gemini_request_bytes)?;
 
             // Log backend request
             if let Some(logger) = &state.logger {
@@ -1099,8 +1112,50 @@ async fn handle_openai_chat_completions(
             if is_streaming {
                 let stream = state.backend_client.gemini_stream_generate_content(gemini_request, &gemini_model, &gemini_api_key).await?;
 
-                // Convert Gemini SSE stream to OpenAI SSE stream
-                let openai_stream = conversion::gemini_raw_stream_to_openai_sse(stream, &request.model);
+                // Convert Gemini stream to OpenAI SSE using IR converters
+                use futures::StreamExt;
+                let frontend_converter_arc = std::sync::Arc::new(frontend_converter);
+                let backend_converter_arc = std::sync::Arc::new(backend_converter);
+                let original_model = request.model.clone();
+
+                let openai_stream = stream.map(move |response_result| {
+                    match response_result {
+                        Ok(gemini_stream_response) => {
+                            // Serialize Gemini stream response
+                            let response_bytes = match serde_json::to_vec(&gemini_stream_response) {
+                                Ok(bytes) => bytes,
+                                Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                                    format!("Failed to serialize Gemini stream response: {}", e))),
+                            };
+
+                            // Parse to IR chunk
+                            let ir_chunk_opt = match backend_converter_arc.parse_stream_chunk(&response_bytes) {
+                                Ok(opt) => opt,
+                                Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                                    format!("Failed to parse IR chunk: {}", e))),
+                            };
+
+                            // Convert IR chunk to OpenAI SSE if present
+                            if let Some(ir_chunk) = ir_chunk_opt {
+                                match frontend_converter_arc.format_stream_chunk(&ir_chunk) {
+                                    Ok(sse_data) => {
+                                        if sse_data.is_empty() {
+                                            Ok(axum::response::sse::Event::default().comment("skipped"))
+                                        } else {
+                                            Ok(axum::response::sse::Event::default().data(sse_data))
+                                        }
+                                    },
+                                    Err(e) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
+                                }
+                            } else {
+                                // Skip if no IR chunk
+                                Ok(axum::response::sse::Event::default().comment("skipped"))
+                            }
+                        },
+                        Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
+                    }
+                });
+
                 Ok(axum::response::Sse::new(openai_stream).into_response())
             } else {
                 let gemini_response = state.backend_client.gemini_generate_content(gemini_request, &gemini_model, &gemini_api_key).await?;
@@ -1116,8 +1171,21 @@ async fn handle_openai_chat_completions(
                     }
                 }
 
-                // Convert Gemini response to OpenAI format
-                let openai_response = conversion::gemini_to_openai_response(gemini_response, &request.model)?;
+                // Convert Gemini response to OpenAI format using IR converters
+                // Serialize Gemini response
+                let gemini_response_bytes = serde_json::to_vec(&gemini_response)?;
+
+                // Parse Gemini response to IR
+                let mut ir_response = backend_converter.parse_response(&gemini_response_bytes).await?;
+
+                // Override model with original client request model
+                ir_response.model = request.model.clone();
+
+                // Format IR to OpenAI response
+                let openai_response_bytes = frontend_converter.format_response(&ir_response).await?;
+
+                // Deserialize OpenAI response
+                let openai_response: louter::models::openai::OpenAIResponse = serde_json::from_slice(&openai_response_bytes)?;
 
                 // Log client response
                 if let Some(logger) = &state.logger {
