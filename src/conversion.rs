@@ -391,6 +391,7 @@ pub fn openai_to_gemini_response(
         candidates.push(Candidate {
             content,
             finish_reason,
+            index: Some(0),
             safety_ratings: None,
             citation_metadata: None,
         });
@@ -623,16 +624,19 @@ pub fn openai_stream_to_gemini_sse(
                                 let error_chunk = GeminiStreamResponse {
                                     candidates: vec![Candidate {
                                         content: Content {
-                                            parts: vec![Part::Text { 
-                                                text: format!("Serialization error: {}", e) 
+                                            parts: vec![Part::Text {
+                                                text: format!("Serialization error: {}", e)
                                             }],
                                             role: "model".to_string(),
                                         },
                                         finish_reason: Some("ERROR".to_string()),
+                                        index: Some(0),
                                         safety_ratings: None,
                                         citation_metadata: None,
                                     }],
                                     usage_metadata: None,
+                                    model_version: None,
+                                    response_id: None,
                                 };
                                 match serde_json::to_string(&error_chunk) {
                                     Ok(error_json) => Ok(Event::default().data(error_json)),
@@ -645,16 +649,19 @@ pub fn openai_stream_to_gemini_sse(
                         let error_chunk = GeminiStreamResponse {
                             candidates: vec![Candidate {
                                 content: Content {
-                                    parts: vec![Part::Text { 
-                                        text: format!("Conversion error: {}", e) 
+                                    parts: vec![Part::Text {
+                                        text: format!("Conversion error: {}", e)
                                     }],
                                     role: "model".to_string(),
                                 },
                                 finish_reason: Some("ERROR".to_string()),
+                                index: Some(0),
                                 safety_ratings: None,
                                 citation_metadata: None,
                             }],
                             usage_metadata: None,
+                            model_version: None,
+                            response_id: None,
                         };
                         match serde_json::to_string(&error_chunk) {
                             Ok(error_json) => Ok(Event::default().data(error_json)),
@@ -686,10 +693,13 @@ pub fn openai_stream_to_gemini_sse(
                             role: "model".to_string(),
                         },
                         finish_reason: Some("ERROR".to_string()),
+                        index: Some(0),
                         safety_ratings: None,
                         citation_metadata: None,
                     }],
                     usage_metadata: None,
+                    model_version: None,
+                    response_id: None,
                 };
                 match serde_json::to_string(&error_chunk) {
                     Ok(error_json) => Ok(Event::default().data(error_json)),
@@ -769,6 +779,7 @@ fn convert_openai_stream_to_gemini(
                 role: "model".to_string(),
             },
             finish_reason,
+            index: Some(0),
             safety_ratings: None,
             citation_metadata: None,
         });
@@ -779,6 +790,8 @@ fn convert_openai_stream_to_gemini(
     Ok(GeminiStreamResponse {
         candidates,
         usage_metadata,
+        model_version: None,
+        response_id: None,
     })
 }
 

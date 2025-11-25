@@ -131,6 +131,8 @@ pub struct Candidate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub safety_ratings: Option<Vec<SafetyRating>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub citation_metadata: Option<CitationMetadata>,
@@ -196,6 +198,10 @@ pub struct GeminiStreamResponse {
     pub candidates: Vec<Candidate>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage_metadata: Option<UsageMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
 }
 
 // CountTokens API models

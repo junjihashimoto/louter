@@ -914,12 +914,9 @@ async fn stream_generate_content_impl(
                                 // Convert each IR chunk to Gemini format
                                 ir_chunks.into_iter().filter_map(|chunk| {
                                     if let Ok(gemini_chunk_str) = frontend_converter.format_stream_chunk(&chunk) {
-                                        // Skip chunks with empty candidates (including initial metadata chunk)
-                                        if gemini_chunk_str.contains(r#""candidates":[]"#) {
-                                            return None;
-                                        }
-                                        // Skip chunks with empty parts (including final finish chunk)
-                                        if gemini_chunk_str.contains(r#""parts":[]"#) {
+                                        // Skip chunks with empty candidates AND no usage metadata
+                                        // (but keep the final chunk with finishReason and usageMetadata)
+                                        if gemini_chunk_str.contains(r#""candidates":[]"#) && !gemini_chunk_str.contains(r#""usageMetadata""#) {
                                             return None;
                                         }
 
@@ -1042,12 +1039,9 @@ async fn stream_generate_content_impl(
                             ir_chunks.into_iter().filter_map(|chunk| {
                                 // Convert IR chunk back to Gemini frontend format
                                 if let Ok(gemini_chunk_str) = frontend_converter.format_stream_chunk(&chunk) {
-                                    // Skip chunks with empty candidates (including initial metadata chunk)
-                                    if gemini_chunk_str.contains(r#""candidates":[]"#) {
-                                        return None;
-                                    }
-                                    // Skip chunks with empty parts (including final finish chunk)
-                                    if gemini_chunk_str.contains(r#""parts":[]"#) {
+                                    // Skip chunks with empty candidates AND no usage metadata
+                                    // (but keep the final chunk with finishReason and usageMetadata)
+                                    if gemini_chunk_str.contains(r#""candidates":[]"#) && !gemini_chunk_str.contains(r#""usageMetadata""#) {
                                         return None;
                                     }
 

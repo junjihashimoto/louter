@@ -110,6 +110,7 @@ impl FrontendConverter for GeminiFrontendConverter {
             candidates: vec![crate::models::gemini::Candidate {
                 content,
                 finish_reason,
+                index: Some(0),
                 safety_ratings: None,
                 citation_metadata: None,
             }],
@@ -126,6 +127,10 @@ impl FrontendConverter for GeminiFrontendConverter {
 
     fn format_stream_chunk(&self, chunk: &IRStreamChunk) -> ConverterResult<String> {
         // Convert IR chunk to Gemini stream format
+        // Extract common fields for all chunks
+        let model_version = Some(chunk.model.clone());
+        let response_id = Some(chunk.message_id.clone());
+
         let stream_response = match &chunk.chunk_type {
             IRChunkType::MessageStart { message: _, usage } => {
                 // Initial chunk with usage
@@ -137,6 +142,8 @@ impl FrontendConverter for GeminiFrontendConverter {
                         total_token_count: usage.input_tokens,
                         thoughts_token_count: None,
                     }),
+                    model_version,
+                    response_id,
                 }
             },
             IRChunkType::ContentBlockStart { index: _, content_block } => {
@@ -148,10 +155,13 @@ impl FrontendConverter for GeminiFrontendConverter {
                             parts: vec![],
                         },
                         finish_reason: None,
+                        index: Some(0),
                         safety_ratings: None,
                         citation_metadata: None,
                     }],
                     usage_metadata: None,
+                    model_version,
+                    response_id,
                 }
             },
             IRChunkType::ContentBlockDelta { index: _, delta } => {
@@ -174,10 +184,13 @@ impl FrontendConverter for GeminiFrontendConverter {
                             parts: vec![part],
                         },
                         finish_reason: None,
+                        index: Some(0),
                         safety_ratings: None,
                         citation_metadata: None,
                     }],
                     usage_metadata: None,
+                    model_version,
+                    response_id,
                 }
             },
             IRChunkType::ContentBlockStop { index: _ } => {
@@ -185,6 +198,8 @@ impl FrontendConverter for GeminiFrontendConverter {
                 GeminiStreamResponse {
                     candidates: vec![],
                     usage_metadata: None,
+                    model_version,
+                    response_id,
                 }
             },
             IRChunkType::MessageDelta { delta, usage } => {
@@ -199,6 +214,7 @@ impl FrontendConverter for GeminiFrontendConverter {
                             parts: vec![],
                         },
                         finish_reason,
+                        index: Some(0),
                         safety_ratings: None,
                         citation_metadata: None,
                     }],
@@ -208,6 +224,8 @@ impl FrontendConverter for GeminiFrontendConverter {
                         total_token_count: usage.input_tokens + usage.output_tokens,
                         thoughts_token_count: usage.thinking_tokens,
                     }),
+                    model_version,
+                    response_id,
                 }
             },
             IRChunkType::MessageStop => {
@@ -215,6 +233,8 @@ impl FrontendConverter for GeminiFrontendConverter {
                 GeminiStreamResponse {
                     candidates: vec![],
                     usage_metadata: None,
+                    model_version,
+                    response_id,
                 }
             },
             IRChunkType::Ping => {
