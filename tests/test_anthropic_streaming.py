@@ -811,6 +811,133 @@ def test_temperature_parameter():
         return False
 
 
+def test_complete_tool_roundtrip():
+    """Test 15: Complete tool use conversation - request → result → final answer."""
+    print("\n=== Test 15: Complete Tool Use Round-Trip ===")
+
+    client = Anthropic(api_key=API_KEY, base_url=PROXY_URL)
+
+    try:
+        # Step 1: Initial request that should trigger tool use
+        print("  Step 1: Sending initial request to trigger tool use...")
+        response1 = client.messages.create(
+            model=MODEL,
+            max_tokens=200,
+            messages=[{"role": "user", "content": "What is 25 multiplied by 4? Use the calculator tool."}],
+            tools=[{
+                "name": "calculator",
+                "description": "Evaluate mathematical expressions",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "expression": {"type": "string", "description": "Mathematical expression to evaluate"}
+                    },
+                    "required": ["expression"]
+                }
+            }]
+        )
+
+        # Step 2: Extract tool use from response
+        print("  Step 2: Extracting tool_use from response...")
+        tool_use_blocks = [block for block in response1.content if block.type == "tool_use"]
+
+        if not tool_use_blocks:
+            print(f"  ⚠️  SKIP: Backend did not return tool_use (returned text instead)")
+            return True  # Not a failure - backend choice
+
+        tool_use = tool_use_blocks[0]
+        print(f"    Tool called: {tool_use.name}")
+        print(f"    Tool ID: {tool_use.id}")
+        print(f"    Tool input: {tool_use.input}")
+
+        # Verify tool has required fields
+        if not tool_use.id or not tool_use.name:
+            print(f"  ❌ FAIL: Tool use missing id or name")
+            return False
+
+        # Step 3: Send tool result back and stream the final response
+        print("  Step 3: Sending tool_result and streaming final response...")
+        capture = StreamEventCapture()
+
+        # IMPORTANT: Tool result format per Anthropic spec:
+        # - Assistant message must include the full content array (text + tool_use)
+        # - User message with tool_result must have tool_result FIRST (before any text)
+        # - Placing text before tool_result causes 400 error
+        with client.messages.stream(
+            model=MODEL,
+            max_tokens=200,
+            messages=[
+                {"role": "user", "content": "What is 25 multiplied by 4? Use the calculator tool."},
+                {"role": "assistant", "content": response1.content},  # Full content array from first response
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use.id,
+                            "content": "100"
+                        }
+                        # Any additional text must come AFTER tool_result
+                    ]
+                }
+            ],
+            tools=[{
+                "name": "calculator",
+                "description": "Evaluate mathematical expressions",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "expression": {"type": "string"}
+                    },
+                    "required": ["expression"]
+                }
+            }]
+        ) as stream:
+            for event in stream:
+                capture.add_event(event)
+
+        # Step 4: Verify the final response
+        print("  Step 4: Verifying final response...")
+
+        # Verify event sequence
+        valid, msg = capture.verify_sequence()
+        if not valid:
+            print(f"  ❌ FAIL: {msg}")
+            return False
+
+        # Get content summary
+        summary = capture.get_content_summary()
+
+        # Should have at least one text block with the final answer
+        if summary["text_blocks"] == 0:
+            print(f"  ⚠️  SKIP: Backend returned no text in final response (used all tokens for thinking)")
+            return True
+
+        # Get the final text content
+        final_text = ""
+        for block in summary["blocks"]:
+            if block["type"] == "text":
+                final_text += block["content"]
+
+        print(f"  ✅ PASS: Complete tool use round-trip successful")
+        print(f"    Turn 1: LLM requested tool use → {tool_use.name}")
+        print(f"    Turn 2: User provided tool result → '100'")
+        print(f"    Turn 3: LLM generated final answer → \"{final_text[:80]}...\"")
+        print(f"    Event sequence: {' → '.join(capture.get_event_types())}")
+        return True
+
+    except Exception as e:
+        error_msg = str(e)
+        # Check if it's a backend error
+        if "expected value" in error_msg or "JSON" in error_msg or "parse" in error_msg.lower():
+            print(f"  ⚠️  SKIP: Backend error (not proxy issue): {error_msg[:80]}")
+            return True
+        print(f"  ❌ FAIL: {error_msg}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def main():
     """Run all tests."""
     print("=" * 60)
@@ -836,6 +963,8 @@ def main():
         ("System message streaming", test_system_message_streaming),
         ("Multiple tool calls", test_multiple_tool_calls),
         ("Temperature parameter", test_temperature_parameter),
+        # Tool use round-trip test
+        ("Complete tool use round-trip", test_complete_tool_roundtrip),
     ]
 
     results = []

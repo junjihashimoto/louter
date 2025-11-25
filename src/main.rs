@@ -1746,7 +1746,31 @@ async fn handle_anthropic_messages(
                     // Convert IR chunk to Anthropic SSE if present
                     if let Some(ir_chunk) = ir_chunk_opt {
                         match frontend_converter_arc.format_stream_chunk(&ir_chunk) {
-                            Ok(sse_data) => Ok(axum::response::sse::Event::default().data(sse_data)),
+                            Ok(sse_string) => {
+                                // The converter returns full SSE format (event: X\ndata: Y\n\n)
+                                // We need to parse it and build proper Axum SSE Event
+                                // Parse event type and data from the SSE string
+                                let mut event_type = None;
+                                let mut data_parts = Vec::new();
+
+                                for line in sse_string.lines() {
+                                    if let Some(event_name) = line.strip_prefix("event: ") {
+                                        event_type = Some(event_name.to_string());
+                                    } else if let Some(data_content) = line.strip_prefix("data: ") {
+                                        data_parts.push(data_content.to_string());
+                                    }
+                                }
+
+                                let mut event = axum::response::sse::Event::default();
+                                if let Some(event_name) = event_type {
+                                    event = event.event(event_name);
+                                }
+                                if !data_parts.is_empty() {
+                                    event = event.data(data_parts.join("\n"));
+                                }
+
+                                Ok(event)
+                            },
                             Err(e) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
                         }
                     } else {

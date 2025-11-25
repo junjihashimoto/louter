@@ -1044,6 +1044,7 @@ pub struct FrontendApiInfo {
 pub struct FrontendDiagnostics {
     pub gemini_api: FrontendApiInfo,
     pub openai_api: FrontendApiInfo,
+    pub anthropic_api: FrontendApiInfo,
 }
 
 /// Combined diagnostics (backend + frontend)
@@ -1594,6 +1595,292 @@ fn get_passed_capabilities(test_results: &[FrontendTestResult]) -> Vec<String> {
     passed
 }
 
+/// Test Anthropic API frontend endpoint
+pub async fn test_anthropic_frontend(port: u16, config: &Config) -> Vec<FrontendTestResult> {
+    let mut results = Vec::new();
+
+    // Test ALL backends (OpenAI and Gemini protocol) through Anthropic API
+    for (backend_name, backend_config) in config.backends.iter() {
+        // Skip unreachable backends
+        if backend_config.url.is_empty() {
+            continue;
+        }
+
+        // Get model from this backend's model_mapping
+        let model_name = match backend_config.model_mapping.keys().next() {
+            Some(model) => model.clone(),
+            None => {
+                warn!("Backend '{}' has no model_mapping, skipping", backend_name);
+                continue;
+            }
+        };
+
+        // Determine conversion mode
+        let conversion_mode = if backend_config.protocol == "anthropic" {
+            "native"
+        } else {
+            "conversion"
+        };
+
+        // Test text capability (all backends should support this)
+        if backend_config.capabilities.is_empty() || backend_config.capabilities.contains(&"text".to_string()) {
+            info!("Testing Anthropic API → {} backend ({}) - Text capability", backend_name, conversion_mode);
+            results.push(test_anthropic_text(port, &model_name, backend_name, conversion_mode).await);
+        }
+
+        // Test vision capability
+        if backend_config.capabilities.is_empty() || backend_config.capabilities.contains(&"vision".to_string()) {
+            info!("Testing Anthropic API → {} backend ({}) - Vision capability", backend_name, conversion_mode);
+            results.push(test_anthropic_vision(port, &model_name, backend_name, conversion_mode).await);
+        }
+
+        // Test function calling
+        if backend_config.capabilities.is_empty() || backend_config.capabilities.contains(&"function_calling".to_string()) {
+            info!("Testing Anthropic API → {} backend ({}) - Function Calling capability", backend_name, conversion_mode);
+            results.push(test_anthropic_tools(port, &model_name, backend_name, conversion_mode).await);
+        }
+    }
+
+    results
+}
+
+/// Test Anthropic API text generation
+async fn test_anthropic_text(port: u16, model_name: &str, backend_name: &str, conversion_mode: &str) -> FrontendTestResult {
+    let client = reqwest::Client::new();
+    let start = std::time::Instant::now();
+    let url = format!("http://localhost:{}/v1/messages", port);
+
+    let body = serde_json::json!({
+        "model": model_name,
+        "messages": [
+            {"role": "user", "content": "Say 'test' in one word"}
+        ],
+        "max_tokens": 100
+    });
+
+    let result = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("x-api-key", "test-key")
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await;
+
+    let response_time_ms = start.elapsed().as_millis() as u64;
+
+    match result {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.json::<serde_json::Value>().await {
+                Ok(json) => {
+                    let has_content = json.get("content").and_then(|c| c.as_array()).map(|a| !a.is_empty()).unwrap_or(false);
+                    FrontendTestResult {
+                        test_name: format!("Anthropic API → {} backend: Text", backend_name),
+                        endpoint: "/v1/messages".to_string(),
+                        passed: has_content,
+                        error: if !has_content { Some("No content in response".to_string()) } else { None },
+                        response_time_ms: Some(response_time_ms),
+                        backend_used: Some(backend_name.to_string()),
+                        capability: Some("text".to_string()),
+                        conversion_mode: Some(conversion_mode.to_string()),
+                    }
+                },
+                Err(e) => FrontendTestResult {
+                    test_name: format!("Anthropic API → {} backend: Text", backend_name),
+                    endpoint: "/v1/messages".to_string(),
+                    passed: false,
+                    error: Some(format!("Failed to parse response: {}", e)),
+                    response_time_ms: Some(response_time_ms),
+                    backend_used: Some(backend_name.to_string()),
+                    capability: Some("text".to_string()),
+                    conversion_mode: Some(conversion_mode.to_string()),
+                }
+            }
+        },
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_else(|_| "Could not read body".to_string());
+            FrontendTestResult {
+                test_name: format!("Anthropic API → {} backend: Text", backend_name),
+                endpoint: "/v1/messages".to_string(),
+                passed: false,
+                error: Some(body),
+                response_time_ms: Some(response_time_ms),
+                backend_used: Some(backend_name.to_string()),
+                capability: Some("text".to_string()),
+                conversion_mode: Some(conversion_mode.to_string()),
+            }
+        },
+        Err(e) => FrontendTestResult {
+            test_name: format!("Anthropic API → {} backend: Text", backend_name),
+            endpoint: "/v1/messages".to_string(),
+            passed: false,
+            error: Some(format!("Request failed: {}", e)),
+            response_time_ms: Some(response_time_ms),
+            backend_used: Some(backend_name.to_string()),
+            capability: Some("text".to_string()),
+            conversion_mode: Some(conversion_mode.to_string()),
+        }
+    }
+}
+
+/// Test Anthropic API vision capability
+async fn test_anthropic_vision(port: u16, model_name: &str, backend_name: &str, conversion_mode: &str) -> FrontendTestResult {
+    let client = reqwest::Client::new();
+    let start = std::time::Instant::now();
+    let url = format!("http://localhost:{}/v1/messages", port);
+
+    // Small test image (1x1 red pixel PNG, base64 encoded)
+    let test_image = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==";
+
+    let body = serde_json::json!({
+        "model": model_name,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What color is this?"},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": test_image
+                        }
+                    }
+                ]
+            }
+        ],
+        "max_tokens": 100
+    });
+
+    let result = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("x-api-key", "test-key")
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await;
+
+    let response_time_ms = start.elapsed().as_millis() as u64;
+
+    match result {
+        Ok(resp) if resp.status().is_success() => {
+            FrontendTestResult {
+                test_name: format!("Anthropic API → {} backend: Vision", backend_name),
+                endpoint: "/v1/messages".to_string(),
+                passed: true,
+                error: None,
+                response_time_ms: Some(response_time_ms),
+                backend_used: Some(backend_name.to_string()),
+                capability: Some("vision".to_string()),
+                conversion_mode: Some(conversion_mode.to_string()),
+            }
+        },
+        Ok(resp) => {
+            let body = resp.text().await.unwrap_or_else(|_| "Could not read body".to_string());
+            FrontendTestResult {
+                test_name: format!("Anthropic API → {} backend: Vision", backend_name),
+                endpoint: "/v1/messages".to_string(),
+                passed: false,
+                error: Some(body),
+                response_time_ms: Some(response_time_ms),
+                backend_used: Some(backend_name.to_string()),
+                capability: Some("vision".to_string()),
+                conversion_mode: Some(conversion_mode.to_string()),
+            }
+        },
+        Err(e) => FrontendTestResult {
+            test_name: format!("Anthropic API → {} backend: Vision", backend_name),
+            endpoint: "/v1/messages".to_string(),
+            passed: false,
+            error: Some(format!("Request failed: {}", e)),
+            response_time_ms: Some(response_time_ms),
+            backend_used: Some(backend_name.to_string()),
+            capability: Some("vision".to_string()),
+            conversion_mode: Some(conversion_mode.to_string()),
+        }
+    }
+}
+
+/// Test Anthropic API function calling (tools)
+async fn test_anthropic_tools(port: u16, model_name: &str, backend_name: &str, conversion_mode: &str) -> FrontendTestResult {
+    let client = reqwest::Client::new();
+    let start = std::time::Instant::now();
+    let url = format!("http://localhost:{}/v1/messages", port);
+
+    let body = serde_json::json!({
+        "model": model_name,
+        "messages": [
+            {"role": "user", "content": "What's the weather in Tokyo?"}
+        ],
+        "tools": [
+            {
+                "name": "get_weather",
+                "description": "Get current weather for a location",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string", "description": "City name"}
+                    },
+                    "required": ["location"]
+                }
+            }
+        ],
+        "max_tokens": 200
+    });
+
+    let result = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("x-api-key", "test-key")
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await;
+
+    let response_time_ms = start.elapsed().as_millis() as u64;
+
+    match result {
+        Ok(resp) if resp.status().is_success() => {
+            FrontendTestResult {
+                test_name: format!("Anthropic API → {} backend: Function Calling", backend_name),
+                endpoint: "/v1/messages".to_string(),
+                passed: true,
+                error: None,
+                response_time_ms: Some(response_time_ms),
+                backend_used: Some(backend_name.to_string()),
+                capability: Some("function_calling".to_string()),
+                conversion_mode: Some(conversion_mode.to_string()),
+            }
+        },
+        Ok(resp) => {
+            let body = resp.text().await.unwrap_or_else(|_| "Could not read body".to_string());
+            FrontendTestResult {
+                test_name: format!("Anthropic API → {} backend: Function Calling", backend_name),
+                endpoint: "/v1/messages".to_string(),
+                passed: false,
+                error: Some(body),
+                response_time_ms: Some(response_time_ms),
+                backend_used: Some(backend_name.to_string()),
+                capability: Some("function_calling".to_string()),
+                conversion_mode: Some(conversion_mode.to_string()),
+            }
+        },
+        Err(e) => FrontendTestResult {
+            test_name: format!("Anthropic API → {} backend: Function Calling", backend_name),
+            endpoint: "/v1/messages".to_string(),
+            passed: false,
+            error: Some(format!("Request failed: {}", e)),
+            response_time_ms: Some(response_time_ms),
+            backend_used: Some(backend_name.to_string()),
+            capability: Some("function_calling".to_string()),
+            conversion_mode: Some(conversion_mode.to_string()),
+        }
+    }
+}
+
 /// Run complete diagnostics (backend + frontend)
 pub async fn run_complete_diagnostics(
     port: u16,
@@ -1602,9 +1889,11 @@ pub async fn run_complete_diagnostics(
 ) -> CompleteDiagnostics {
     let gemini_tests = test_gemini_frontend(port, config).await;
     let openai_tests = test_openai_frontend(port, config).await;
+    let anthropic_tests = test_anthropic_frontend(port, config).await;
 
     let gemini_passed = get_passed_capabilities(&gemini_tests);
     let openai_passed = get_passed_capabilities(&openai_tests);
+    let anthropic_passed = get_passed_capabilities(&anthropic_tests);
 
     // Test each backend model through both frontend APIs
     let mut gemini_model_tests = Vec::new();
@@ -1683,6 +1972,20 @@ pub async fn run_complete_diagnostics(
                 ],
                 test_results: openai_tests,
                 model_tests: openai_model_tests,
+            },
+            anthropic_api: FrontendApiInfo {
+                api_name: "Anthropic API".to_string(),
+                supported_capabilities: vec![
+                    "text".to_string(),
+                    "vision".to_string(),
+                    "function_calling".to_string(),
+                ],
+                passed_capabilities: anthropic_passed,
+                endpoints: vec![
+                    "/v1/messages".to_string(),
+                ],
+                test_results: anthropic_tests,
+                model_tests: vec![],  // Can add anthropic model tests later
             },
         },
     }
