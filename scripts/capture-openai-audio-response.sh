@@ -1,0 +1,52 @@
+#!/bin/bash
+# Capture audio response from OpenAI API
+
+API_KEY="${OPENAI_API_KEY}"
+MODEL="gpt-4o-audio-preview"
+
+# 0.2 second audio sample at 16kHz (440 Hz tone, base64-encoded WAV)
+AUDIO_BASE64="UklGRiQZAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAZAAAAAJoGAQ0GE3kYMh0NIesjtyVkJu0lVCSmIfcdZBkQFCIOyQc0AZf6I/QJ7njomuOV34fch9ql2ejZTdvK3Uzht+Xs6sDwCveX/TYEtgrkEJEWkxvCH/8iMSVHJjomCSW+ImofJhsUFlkQIQqdA/38dPYz8GvqSOXw4IXdIdvW2a7ZqtrD3OjfA+Ty6JLutvQw+88BYAixDpMU1xlXHu8hhCQEJmEmmSWzI70gzRwCGH8ScAwBBmb/z/hu8nXsEOdq4qbe4Nst2prZLdrg26beauIQ53XsbvLP+Gb/AQZwDH8SAhjNHL0gsyOZJWEmBCaEJO8hVx7XGZMUsQ5gCM8BMPu29JLu8ugD5Ojfw9yq2q7Z1tkh24Xd8OBI5WvqM/B09v38nQMhClkQFBYmG2ofviIJJTomRyYxJf8iwh+TG5EW5BC2CjYEl/0K98Dw7Oq35Uzhyt1N2+jZpdmH2ofcld+a43joCe4j9Jf6NAHJByIOEBRkGfcdpiFUJO0lZCa3JesjDSEyHXkYBhMBDZoGAABm+f/y+uyH587i894V3EnanNkT2qzbWt4J4pzm8Ove8Tf4zP5pBd0L9xGIF2YcayB5I3klWyYYJrMkNiK0HkkaFBVAD/YIaQLK+0r1HO9v6W3kPuAB3c/audnG2ffaQt2W4Nrk7Omn79/1Y/wDA4wJzQ+VFbgaEB97It8kKiZSJlYlPSMYIP0bDhduEUoL0AQx/qD3T/Ft6ynmqeER3nzb/Nmf2WfaTdxD3zPj/ueB7ZDz//maADEHkg2LE/AYlh1aISAk0yVmJtMlICRaIZYd8BiLE5INMQeaAP/5kPOB7f7nM+ND303cZ9qf2fzZfNsR3qnhKeZt60/xoPcx/tAESgtuEQ4X/RsYID0jViVSJiom3yR7IhAfuBqVFc0PjAkDA2P83/Wn7+zp2uSW4ELd99rG2bnZz9oB3T7gbeRv6RzvSvXK+2kC9ghADxQVSRq0HjYisyQYJlsmeSV5I2sgZhyIF/cR3QtpBcz+N/je8fDrnOYJ4lrerNsT2pzZSdoV3PPezuKH5/rs//Jm+QAAmgYBDQYTeRgyHQ0h6yO3JWQm7SVUJKYh9x1kGRAUIg7JBzQBl/oj9AnueOia45Xfh9yH2qXZ6NlN28rdTOG35ezqwPAK95f9NgS2CuQQkRaTG8If/yIxJUcmOiYJJb4iah8mGxQWWRAhCp0D/fx09jPwa+pI5fDghd0h29bZrtmq2sPc6N8D5PLoku629DD7zwFgCLEOkxTXGVce7yGEJAQmYSaZJbMjvSDNHAIYfxJwDAEGZv/P+G7ydewQ52ript7g2y3amtkt2uDbpt5q4hDndexu8s/4Zv8BBnAMfxICGM0cvSCzI5klYSYEJoQk7yFXHtcZkxSxDmAIzwEw+7b0ku7y6APk6N/D3KrartnW2SHbhd3w4Ejla+oz8HT2/fydAyEKWRAUFiYbah++IgklOiZHJjEl/yLCH5MbkRbkELYKNgSX/Qr3wPDs6rflTOHK3U3b6Nml2Yfah9yV35rjeOgJ7iP0l/o0AckHIg4QFGQZ9x2mIVQk7SVkJrcl6yMNITIdeRgGEwENmgYAAGb5//L67IfnzuLz3hXcSdqc2RParNta3gninObw697xN/jM/mkF3Qv3EYgXZhxrIHkjeSVbJhgmsyQ2IrQeSRoUFUAP9ghpAsr7SvUc72/pbeQ+4AHdz9q52cbZ99pC3Zbg2uTs6afv3/Vj/AMDjAnND5UVuBoQH3si3yQqJlImViU9Ixgg/RsOF24RSgvQBDH+oPdP8W3rKeap4RHefNv82Z/ZZ9pN3EPfM+P+54HtkPP/+ZoAMQeSDYsT8BiWHVohICTTJWYm0yUgJFohlh3wGIsTkg0xB5oA//mQ84Ht/ucz40PfTdxn2p/Z/Nl82xHeqeEp5m3rT/Gg9zH+0ARKC24RDhf9GxggPSNWJVImKibfJHsiEB+4GpUVzQ+MCQMDY/zf9afv7Ona5JbgQt332sbZudnP2gHdPuBt5G/pHO9K9cr7aQL2CEAPFBVJGrQeNiKzJBgmWyZ5JXkjayBmHIgX9xHdC2kFzP43+N7x8Ouc5gniWt6s2xPanNlJ2hXc897O4ofn+uz/8mb5AACaBgENBhN5GDIdDSHrI7clZCbtJVQkpiH3HWQZEBQiDskHNAGX+iP0Ce546Jrjld+H3Ifapdno2U3byt1M4bfl7OrA8Ar3l/02BLYK5BCRFpMbwh//IjElRyY6JgklviJqHyYbFBZZECEKnQP9/HT2M/Br6kjl8OCF3SHb1tmu2araw9zo3wPk8uiS7rb0MPvPAWAIsQ6TFNcZVx7vIYQkBCZhJpklsyO9IM0cAhh/EnAMAQZm/8/4bvJ17BDnauKm3uDbLdqa2S3a4Num3mriEOd17G7yz/hm/wEGcAx/EgIYzRy9ILMjmSVhJgQmhCTvIVce1xmTFLEOYAjPATD7tvSS7vLoA+To38Pcqtqu2dbZIduF3fDgSOVr6jPwdPb9/J0DIQpZEBQWJhtqH74iCSU6JkcmMSX/IsIfkxuRFuQQtgo2BJf9CvfA8Ozqt+VM4crdTdvo2aXZh9qH3JXfmuN46AnuI/SX+jQByQciDhAUZBn3HaYhVCTtJWQmtyXrIw0hMh15GAYTAQ2aBgAAZvn/8vrsh+fO4vPeFdxJ2pzZE9qs21reCeKc5vDr3vE3+Mz+aQXdC/cRiBdmHGsgeSN5JVsmGCazJDYitB5JGhQVQA/2CGkCyvtK9Rzvb+lt5D7gAd3P2rnZxtn32kLdluDa5Ozpp+/f9WP8AwOMCc0PlRW4GhAfeyLfJComUiZWJT0jGCD9Gw4XbhFKC9AEMf6g90/xbesp5qnhEd582/zZn9ln2k3cQ98z4/7nge2Q8//5mgAxB5INixPwGJYdWiEgJNMlZibTJSAkWiGWHfAYixOSDTEHmgD/+ZDzge3+5zPjQ99N3Gfan9n82XzbEd6p4SnmbetP8aD3Mf7QBEoLbhEOF/0bGCA9I1YlUiYqJt8keyIQH7galRXND4wJAwNj/N/1p+/s6drkluBC3ffaxtm52c/aAd0+4G3kb+kc70r1yvtpAvYIQA8UFUkatB42IrMkGCZbJnkleSNrIGYciBf3Ed0LaQXM/jf43vHw65zmCeJa3qzbE9qc2UnaFdzz3s7ih+f67P/yZvkAAJoGAQ0GE3kYMh0NIesjtyVkJu0lVCSmIfcdZBkQFCIOyQc0AZf6I/QJ7njomuOV34fch9ql2ejZTdvK3Uzht+Xs6sDwCveX/TYEtgrkEJEWkxvCH/8iMSVHJjomCSW+ImofJhsUFlkQIQqdA/38dPYz8GvqSOXw4IXdIdvW2a7ZqtrD3OjfA+Ty6JLutvQw+88BYAixDpMU1xlXHu8hhCQEJmEmmSWzI70gzRwCGH8ScAwBBmb/z/hu8nXsEOdq4qbe4Nst2prZLdrg26beauIQ53XsbvLP+Gb/AQZwDH8SAhjNHL0gsyOZJWEmBCaEJO8hVx7XGZMUsQ5gCM8BMPu29JLu8ugD5Ojfw9yq2q7Z1tkh24Xd8OBI5WvqM/B09v38nQMhClkQFBYmG2ofviIJJTomRyYxJf8iwh+TG5EW5BC2CjYEl/0K98Dw7Oq35Uzhyt1N2+jZpdmH2ofcld+a43joCe4j9Jf6NAHJByIOEBRkGfcdpiFUJO0lZCa3JesjDSEyHXkYBhMBDZoGAABm+f/y+uyH587i894V3EnanNkT2qzbWt4J4pzm8Ove8Tf4zP5pBd0L9xGIF2YcayB5I3klWyYYJrMkNiK0HkkaFBVAD/YIaQLK+0r1HO9v6W3kPuAB3c/audnG2ffaQt2W4Nrk7Omn79/1Y/wDA4wJzQ+VFbgaEB97It8kKiZSJlYlPSMYIP0bDhduEUoL0AQx/qD3T/Ft6ynmqeER3nzb/Nmf2WfaTdxD3zPj/ueB7ZDz//maADEHkg2LE/AYlh1aISAk0yVmJtMlICRaIZYd8BiLE5INMQeaAP/5kPOB7f7nM+ND303cZ9qf2fzZfNsR3qnhKeZt60/xoPcx/tAESgtuEQ4X/RsYID0jViVSJiom3yR7IhAfuBqVFc0PjAkDA2P83/Wn7+zp2uSW4ELd99rG2bnZz9oB3T7gbeRv6RzvSvXK+2kC9ghADxQVSRq0HjYisyQYJlsmeSV5I2sgZhyIF/cR3QtpBcz+N/je8fDrnOYJ4lrerNsT2pzZSdoV3PPezuKH5/rs//Jm+QAAmgYBDQYTeRgyHQ0h6yO3JWQm7SVUJKYh9x1kGRAUIg7JBzQBl/oj9AnueOia45Xfh9yH2qXZ6NlN28rdTOG35ezqwPAK95f9NgS2CuQQkRaTG8If/yIxJUcmOiYJJb4iah8mGxQWWRAhCp0D/fx09jPwa+pI5fDghd0h29bZrtmq2sPc6N8D5PLoku629DD7zwFgCLEOkxTXGVce7yGEJAQmYSaZJbMjvSDNHAIYfxJwDAEGZv/P+G7ydewQ52ript7g2y3amtkt2uDbpt5q4hDndexu8s/4Zv8BBnAMfxICGM0cvSCzI5klYSYEJoQk7yFXHtcZkxSxDmAIzwEw+7b0ku7y6APk6N/D3KrartnW2SHbhd3w4Ejla+oz8HT2/fydAyEKWRAUFiYbah++IgklOiZHJjEl/yLCH5MbkRbkELYKNgSX/Qr3wPDs6rflTOHK3U3b6Nml2Yfah9yV35rjeOgJ7iP0l/o0AckHIg4QFGQZ9x2mIVQk7SVkJrcl6yMNITIdeRgGEwENmgYAAGb5//L67IfnzuLz3hXcSdqc2RParNta3gninObw697xN/jM/mkF3Qv3EYgXZhxrIHkjeSVbJhgmsyQ2IrQeSRoUFUAP9ghpAsr7SvUc72/pbeQ+4AHdz9q52cbZ99pC3Zbg2uTs6afv3/Vj/AMDjAnND5UVuBoQH3si3yQqJlImViU9Ixgg/RsOF24RSgvQBDH+oPdP8W3rKeap4RHefNv82Z/ZZ9pN3EPfM+P+54HtkPP/+ZoAMQeSDYsT8BiWHVohICTTJWYm0yUgJFohlh3wGIsTkg0xB5oA//mQ84Ht/ucz40PfTdxn2p/Z/Nl82xHeqeEp5m3rT/Gg9zH+0ARKC24RDhf9GxggPSNWJVImKibfJHsiEB+4GpUVzQ+MCQMDY/zf9afv7Ona5JbgQt332sbZudnP2gHdPuBt5G/pHO9K9cr7aQL2CEAPFBVJGrQeNiKzJBgmWyZ5JXkjayBmHIgX9xHdC2kFzP43+N7x8Ouc5gniWt6s2xPanNlJ2hXc897O4ofn+uz/8mb5AACaBgENBhN5GDIdDSHrI7clZCbtJVQkpiH3HWQZEBQiDskHNAGX+iP0Ce546Jrjld+H3Ifapdno2U3byt1M4bfl7OrA8Ar3l/02BLYK5BCRFpMbwh//IjElRyY6JgklviJqHyYbFBZZECEKnQP9/HT2M/Br6kjl8OCF3SHb1tmu2araw9zo3wPk8uiS7rb0MPvPAWAIsQ6TFNcZVx7vIYQkBCZhJpklsyO9IM0cAhh/EnAMAQZm/8/4bvJ17BDnauKm3uDbLdqa2S3a4Num3mriEOd17G7yz/hm/wEGcAx/EgIYzRy9ILMjmSVhJgQmhCTvIVce1xmTFLEOYAjPATD7tvSS7vLoA+To38Pcqtqu2dbZIduF3fDgSOVr6jPwdPb9/J0DIQpZEBQWJhtqH74iCSU6JkcmMSX/IsIfkxuRFuQQtgo2BJf9CvfA8Ozqt+VM4crdTdvo2aXZh9qH3JXfmuN46AnuI/SX+jQByQciDhAUZBn3HaYhVCTtJWQmtyXrIw0hMh15GAYTAQ2aBgAAZvn/8vrsh+fO4vPeFdxJ2pzZE9qs21reCeKc5vDr3vE3+Mz+aQXdC/cRiBdmHGsgeSN5JVsmGCazJDYitB5JGhQVQA/2CGkCyvtK9Rzvb+lt5D7gAd3P2rnZxtn32kLdluDa5Ozpp+/f9WP8AwOMCc0PlRW4GhAfeyLfJComUiZWJT0jGCD9Gw4XbhFKC9AEMf6g90/xbesp5qnhEd582/zZn9ln2k3cQ98z4/7nge2Q8//5mgAxB5INixPwGJYdWiEgJNMlZibTJSAkWiGWHfAYixOSDTEHmgD/+ZDzge3+5zPjQ99N3Gfan9n82XzbEd6p4SnmbetP8aD3Mf7QBEoLbhEOF/0bGCA9I1YlUiYqJt8keyIQH7galRXND4wJAwNj/N/1p+/s6drkluBC3ffaxtm52c/aAd0+4G3kb+kc70r1yvtpAvYIQA8UFUkatB42IrMkGCZbJnkleSNrIGYciBf3Ed0LaQXM/jf43vHw65zmCeJa3qzbE9qc2UnaFdzz3s7ih+f67P/yZvkAAJoGAQ0GE3kYMh0NIesjtyVkJu0lVCSmIfcdZBkQFCIOyQc0AZf6I/QJ7njomuOV34fch9ql2ejZTdvK3Uzht+Xs6sDwCveX/TYEtgrkEJEWkxvCH/8iMSVHJjomCSW+ImofJhsUFlkQIQqdA/38dPYz8GvqSOXw4IXdIdvW2a7ZqtrD3OjfA+Ty6JLutvQw+88BYAixDpMU1xlXHu8hhCQEJmEmmSWzI70gzRwCGH8ScAwBBmb/z/hu8nXsEOdq4qbe4Nst2prZLdrg26beauIQ53XsbvLP+Gb/AQZwDH8SAhjNHL0gsyOZJWEmBCaEJO8hVx7XGZMUsQ5gCM8BMPu29JLu8ugD5Ojfw9yq2q7Z1tkh24Xd8OBI5WvqM/B09v38nQMhClkQFBYmG2ofviIJJTomRyYxJf8iwh+TG5EW5BC2CjYEl/0K98Dw7Oq35Uzhyt1N2+jZpdmH2ofcld+a43joCe4j9Jf6NAHJByIOEBRkGfcdpiFUJO0lZCa3JesjDSEyHXkYBhMBDZoGAABm+f/y+uyH587i894V3EnanNkT2qzbWt4J4pzm8Ove8Tf4zP5pBd0L9xGIF2YcayB5I3klWyYYJrMkNiK0HkkaFBVAD/YIaQLK+0r1HO9v6W3kPuAB3c/audnG2ffaQt2W4Nrk7Omn79/1Y/wDA4wJzQ+VFbgaEB97It8kKiZSJlYlPSMYIP0bDhduEUoL0AQx/qD3T/Ft6ynmqeER3nzb/Nmf2WfaTdxD3zPj/ueB7ZDz//maADEHkg2LE/AYlh1aISAk0yVmJtMlICRaIZYd8BiLE5INMQeaAP/5kPOB7f7nM+ND303cZ9qf2fzZfNsR3qnhKeZt60/xoPcx/tAESgtuEQ4X/RsYID0jViVSJiom3yR7IhAfuBqVFc0PjAkDA2P83/Wn7+zp2uSW4ELd99rG2bnZz9oB3T7gbeRv6RzvSvXK+2kC9ghADxQVSRq0HjYisyQYJlsmeSV5I2sgZhyIF/cR3QtpBcz+N/je8fDrnOYJ4lrerNsT2pzZSdoV3PPezuKH5/rs//Jm+QAAmgYBDQYTeRgyHQ0h6yO3JWQm7SVUJKYh9x1kGRAUIg7JBzQBl/oj9AnueOia45Xfh9yH2qXZ6NlN28rdTOG35ezqwPAK95f9NgS2CuQQkRaTG8If/yIxJUcmOiYJJb4iah8mGxQWWRAhCp0D/fx09jPwa+pI5fDghd0h29bZrtmq2sPc6N8D5PLoku629DD7zwFgCLEOkxTXGVce7yGEJAQmYSaZJbMjvSDNHAIYfxJwDAEGZv/P+G7ydewQ52ript7g2y3amtkt2uDbpt5q4hDndexu8s/4Zv8BBnAMfxICGM0cvSCzI5klYSYEJoQk7yFXHtcZkxSxDmAIzwEw+7b0ku7y6APk6N/D3KrartnW2SHbhd3w4Ejla+oz8HT2/fydAyEKWRAUFiYbah++IgklOiZHJjEl/yLCH5MbkRbkELYKNgSX/Qr3wPDs6rflTOHK3U3b6Nml2Yfah9yV35rjeOgJ7iP0l/o0AckHIg4QFGQZ9x2mIVQk7SVkJrcl6yMNITIdeRgGEwENmgYAAGb5//L67IfnzuLz3hXcSdqc2RParNta3gninObw697xN/jM/mkF3Qv3EYgXZhxrIHkjeSVbJhgmsyQ2IrQeSRoUFUAP9ghpAsr7SvUc72/pbeQ+4AHdz9q52cbZ99pC3Zbg2uTs6afv3/Vj/AMDjAnND5UVuBoQH3si3yQqJlImViU9Ixgg/RsOF24RSgvQBDH+oPdP8W3rKeap4RHefNv82Z/ZZ9pN3EPfM+P+54HtkPP/+ZoAMQeSDYsT8BiWHVohICTTJWYm0yUgJFohlh3wGIsTkg0xB5oA//mQ84Ht/ucz40PfTdxn2p/Z/Nl82xHeqeEp5m3rT/Gg9zH+0ARKC24RDhf9GxggPSNWJVImKibfJHsiEB+4GpUVzQ+MCQMDY/zf9afv7Ona5JbgQt332sbZudnP2gHdPuBt5G/pHO9K9cr7aQL2CEAPFBVJGrQeNiKzJBgmWyZ5JXkjayBmHIgX9xHdC2kFzP43+N7x8Ouc5gniWt6s2xPanNlJ2hXc897O4ofn+uz/8mb5"
+
+echo "Capturing OpenAI audio response..."
+
+# Create test-data directory if it doesn't exist
+mkdir -p test-data/openai/audio
+
+# Request with audio input
+curl -X POST "https://api.openai.com/v1/chat/completions" \
+  -H "Authorization: Bearer ${API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "'"${MODEL}"'",
+    "modalities": ["text", "audio"],
+    "audio": {
+      "voice": "alloy",
+      "format": "wav"
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "What do you hear in this audio?"
+          },
+          {
+            "type": "input_audio",
+            "input_audio": {
+              "data": "'"${AUDIO_BASE64}"'",
+              "format": "wav"
+            }
+          }
+        ]
+      }
+    ],
+    "max_tokens": 500
+  }' | gzip -9 > test-data/openai/audio/response.json.gz
+
+echo ""
+echo "Response saved to test-data/openai/audio/response.json.gz"
+
+# Display decompressed response for viewing
+echo "Response preview:"
+zcat test-data/openai/audio/response.json.gz | jq -c '{id, model, choices: [.choices[0] | {message: {role, audio: {id: .message.audio.id, data_length: (.message.audio.data | length)}}}]}'

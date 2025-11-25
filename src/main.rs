@@ -158,6 +158,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/chat/completions", post(handle_openai_chat_completions))
         // Anthropic (Claude) API routes
         .route("/v1/messages", post(handle_anthropic_messages))
+        // Catch-all route to log unmatched requests (for debugging)
+        .fallback(catch_all_handler)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -1133,21 +1135,51 @@ async fn handle_openai_chat_completions(
 // Anthropic (Claude) API endpoint
 async fn handle_anthropic_messages(
     State(state): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     Json(request): Json<louter::models::anthropic::MessagesRequest>,
 ) -> Result<Response, ProxyError> {
     let start_time = Instant::now();
     let original_model = request.model.clone();
 
-    info!("Anthropic messages request for model: {}", request.model);
+    // Generate unique request ID for correlation
+    let request_id = uuid::Uuid::new_v4().to_string();
+
+    info!("Anthropic messages request for model: {} (request_id: {})", request.model, request_id);
     debug!("Anthropic request body: {}", serde_json::to_string_pretty(&request).unwrap_or_else(|e| format!("Failed to serialize request: {}", e)));
 
-    // Log client request
+    // Log client request with full details
     if let Some(logger) = &state.logger {
         if let Ok(request_json) = serde_json::to_value(&request) {
-            logger.log_client_request("/v1/messages", "anthropic", &request_json);
+            // Capture headers
+            let mut headers_map = std::collections::HashMap::new();
+            for (key, value) in headers.iter() {
+                if let Ok(value_str) = value.to_str() {
+                    headers_map.insert(key.to_string(), value_str.to_string());
+                }
+            }
+
+            logger.log_client_request_detailed(
+                "/v1/messages",
+                "anthropic",
+                &request_json,
+                "POST",
+                headers_map,
+                request_id.clone(),
+                request.stream.unwrap_or(false),
+            );
         }
     }
+
+    // Helper to classify error type
+    let error_type_from_error = |error: &ProxyError| -> &str {
+        match error {
+            ProxyError::InvalidRequest(_) => "invalid_request",
+            ProxyError::BackendError(_) => "backend_error",
+            ProxyError::ConversionError(_) => "conversion_error",
+            ProxyError::ConfigError(_) => "config_error",
+            ProxyError::SerializationError(_) => "serialization_error",
+        }
+    };
 
     // Content-based routing: Detect required capabilities
     let required_caps: std::collections::HashSet<_> = if request.tools.is_some() {
@@ -1179,11 +1211,49 @@ async fn handle_anthropic_messages(
     };
 
     // Convert Anthropic request to OpenAI format
-    let openai_request = conversion::anthropic_to_openai_request(request.clone(), &selected_backend, &state.config)?;
+    let openai_request = match conversion::anthropic_to_openai_request(request.clone(), &selected_backend, &state.config) {
+        Ok(req) => req,
+        Err(e) => {
+            // Log conversion error
+            if let Some(logger) = &state.logger {
+                if let Ok(request_json) = serde_json::to_value(&request) {
+                    logger.log_error(
+                        "/v1/messages",
+                        "anthropic",
+                        &e.to_string(),
+                        error_type_from_error(&e),
+                        Some(&request_json),
+                        Some(request_id.clone()),
+                        None,
+                    );
+                }
+            }
+            return Err(e);
+        }
+    };
 
     // Get API key for selected backend
-    let openai_api_key = state.config.get_api_key(&selected_backend, "OPENAI_API_KEY")
-        .ok_or_else(|| ProxyError::ConfigError(format!("API key not found for backend '{}' in config or OPENAI_API_KEY environment variable", selected_backend)))?;
+    let openai_api_key = match state.config.get_api_key(&selected_backend, "OPENAI_API_KEY") {
+        Some(key) => key,
+        None => {
+            let error = ProxyError::ConfigError(format!("API key not found for backend '{}' in config or OPENAI_API_KEY environment variable", selected_backend));
+            // Log config error
+            if let Some(logger) = &state.logger {
+                if let Ok(request_json) = serde_json::to_value(&request) {
+                    logger.log_error(
+                        "/v1/messages",
+                        "anthropic",
+                        &error.to_string(),
+                        "config_error",
+                        Some(&request_json),
+                        Some(request_id.clone()),
+                        None,
+                    );
+                }
+            }
+            return Err(error);
+        }
+    };
 
     // Log backend request
     if let Some(logger) = &state.logger {
@@ -1199,14 +1269,52 @@ async fn handle_anthropic_messages(
         let mut streaming_request = openai_request;
         streaming_request.stream = Some(true);
 
-        let stream = state.backend_client.chat_completion_stream(&selected_backend, streaming_request, &openai_api_key).await?;
+        let stream = match state.backend_client.chat_completion_stream(&selected_backend, streaming_request, &openai_api_key).await {
+            Ok(s) => s,
+            Err(e) => {
+                // Log backend error
+                if let Some(logger) = &state.logger {
+                    if let Ok(request_json) = serde_json::to_value(&request) {
+                        logger.log_error(
+                            "/v1/messages",
+                            "anthropic",
+                            &e.to_string(),
+                            "backend_error",
+                            Some(&request_json),
+                            Some(request_id.clone()),
+                            None,
+                        );
+                    }
+                }
+                return Err(e);
+            }
+        };
 
         // Convert OpenAI stream to Anthropic SSE format
         let anthropic_stream = conversion::openai_stream_to_anthropic_sse(stream, &original_model);
         Ok(axum::response::Sse::new(anthropic_stream).into_response())
     } else {
         // Non-streaming mode
-        let openai_response = state.backend_client.chat_completion(&selected_backend, openai_request, &openai_api_key).await?;
+        let openai_response = match state.backend_client.chat_completion(&selected_backend, openai_request, &openai_api_key).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                // Log backend error
+                if let Some(logger) = &state.logger {
+                    if let Ok(request_json) = serde_json::to_value(&request) {
+                        logger.log_error(
+                            "/v1/messages",
+                            "anthropic",
+                            &e.to_string(),
+                            "backend_error",
+                            Some(&request_json),
+                            Some(request_id.clone()),
+                            None,
+                        );
+                    }
+                }
+                return Err(e);
+            }
+        };
 
         // Log backend response
         if let Some(logger) = &state.logger {
@@ -1216,7 +1324,26 @@ async fn handle_anthropic_messages(
         }
 
         // Convert OpenAI response to Anthropic format
-        let anthropic_response = conversion::openai_to_anthropic_response(openai_response.clone(), &original_model)?;
+        let anthropic_response = match conversion::openai_to_anthropic_response(openai_response.clone(), &original_model) {
+            Ok(resp) => resp,
+            Err(e) => {
+                // Log conversion error
+                if let Some(logger) = &state.logger {
+                    if let Ok(request_json) = serde_json::to_value(&request) {
+                        logger.log_error(
+                            "/v1/messages",
+                            "anthropic",
+                            &e.to_string(),
+                            error_type_from_error(&e),
+                            Some(&request_json),
+                            Some(request_id.clone()),
+                            None,
+                        );
+                    }
+                }
+                return Err(e);
+            }
+        };
 
         // Calculate metrics
         let e2e_latency_ms = start_time.elapsed().as_secs_f64() * 1000.0;
@@ -1257,6 +1384,52 @@ async fn handle_anthropic_messages(
 
         Ok(Json(anthropic_response).into_response())
     }
+}
+
+// Catch-all handler to log unmatched requests
+async fn catch_all_handler(
+    State(state): State<AppState>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+    body: String,
+) -> Result<Response, ProxyError> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+
+    warn!("⚠ Unmatched request: {} {} (request_id: {})", method, uri, request_id);
+    warn!("Headers: {:?}", headers.iter().map(|(k, v)| (k.as_str(), v.to_str().unwrap_or("<binary>"))).collect::<Vec<_>>());
+    warn!("Body: {}", if body.is_empty() { "<empty>" } else { &body[..body.len().min(200)] });
+
+    // Log to file with full details
+    if let Some(logger) = &state.logger {
+        let mut headers_map = std::collections::HashMap::new();
+        for (key, value) in headers.iter() {
+            if let Ok(value_str) = value.to_str() {
+                headers_map.insert(key.to_string(), value_str.to_string());
+            }
+        }
+
+        let body_json = if body.is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&body).unwrap_or(serde_json::json!({"raw": body}))
+        };
+
+        logger.log_error(
+            uri.path(),
+            "unknown",
+            &format!("404 Not Found: {} {}", method, uri.path()),
+            "not_found",
+            Some(&body_json),
+            Some(request_id),
+            Some(404),
+        );
+    }
+
+    Err(ProxyError::InvalidRequest(format!(
+        "Endpoint not found: {} {}. Available endpoints: /v1/messages, /v1/chat/completions, /health, /metrics, /ui",
+        method, uri.path()
+    )))
 }
 
 // UI handler wrappers to convert AppState to UiState
