@@ -125,14 +125,14 @@ impl BackendConverter for OpenAIBackendConverter {
         })
     }
 
-    fn parse_stream_chunk(&self, event_data: &[u8]) -> ConverterResult<Option<IRStreamChunk>> {
+    fn parse_stream_chunk(&self, event_data: &[u8]) -> ConverterResult<Vec<IRStreamChunk>> {
         // Parse SSE data line
         let data_str = std::str::from_utf8(event_data)
             .map_err(|e| ProxyError::ConversionError(format!("Invalid UTF-8: {}", e)))?;
 
         // Skip [DONE] marker
         if data_str.trim() == "[DONE]" {
-            return Ok(None);
+            return Ok(vec![]);
         }
 
         // Parse JSON
@@ -142,75 +142,82 @@ impl BackendConverter for OpenAIBackendConverter {
         // Get first choice
         let choice = match chunk.choices.first() {
             Some(c) => c,
-            None => return Ok(None),
+            None => return Ok(vec![]),
         };
 
-        // Determine chunk type based on delta content
-        let chunk_type = if choice.finish_reason.is_some() {
-            // Message end
+        let mut chunks = Vec::new();
+
+        // Helper to create chunk
+        let make_chunk = |chunk_type: IRChunkType| IRStreamChunk {
+            message_id: chunk.id.clone(),
+            model: chunk.model.clone(),
+            chunk_type,
+        };
+
+        // Determine chunk types based on delta content
+        if choice.finish_reason.is_some() {
+            // Message end - emit content_block_stop + message_delta + message_stop
+            chunks.push(make_chunk(IRChunkType::ContentBlockStop { index: 0 }));
+
             let stop_reason = choice.finish_reason.as_ref()
                 .and_then(|r| convert_finish_reason_to_ir(r));
 
-            IRChunkType::MessageDelta {
+            chunks.push(make_chunk(IRChunkType::MessageDelta {
                 delta: IRMessageDelta {
                     stop_reason,
                     stop_sequence: None,
                 },
                 usage: IRUsage::default(),
-            }
+            }));
+
+            chunks.push(make_chunk(IRChunkType::MessageStop));
+
         } else if let Some(content) = &choice.delta.content {
             // Text delta
-            IRChunkType::ContentBlockDelta {
+            // Only emit the delta - we'll rely on Anthropic frontend to add content_block_start
+            // when it sees the first delta after message_start
+            chunks.push(make_chunk(IRChunkType::ContentBlockDelta {
                 index: 0,
                 delta: IRDelta::TextDelta {
                     text: content.clone(),
                 },
-            }
+            }));
+
         } else if let Some(tool_calls) = &choice.delta.tool_calls {
             // Tool call delta
             if let Some(tool_call) = tool_calls.first() {
                 if let Some(name) = &tool_call.function.name {
                     // Start of tool call
-                    IRChunkType::ContentBlockStart {
+                    chunks.push(make_chunk(IRChunkType::ContentBlockStart {
                         index: tool_call.index.unwrap_or(0),
                         content_block: IRContentBlockStart::ToolUse {
                             id: tool_call.id.clone().unwrap_or_default(),
                             name: name.clone(),
                         },
-                    }
+                    }));
                 } else if !tool_call.function.arguments.is_empty() {
                     // Tool call arguments delta
-                    IRChunkType::ContentBlockDelta {
+                    chunks.push(make_chunk(IRChunkType::ContentBlockDelta {
                         index: tool_call.index.unwrap_or(0),
                         delta: IRDelta::InputJsonDelta {
                             partial_json: tool_call.function.arguments.clone(),
                         },
-                    }
-                } else {
-                    return Ok(None);
+                    }));
                 }
-            } else {
-                return Ok(None);
             }
         } else if choice.delta.role.is_some() {
             // First chunk - message start
-            IRChunkType::MessageStart {
+            chunks.push(make_chunk(IRChunkType::MessageStart {
                 message: IRMessage {
                     role: IRRole::Assistant,
                     content: Vec::new(),
                     name: None,
                 },
                 usage: IRUsage::default(),
-            }
-        } else {
-            return Ok(None);
-        };
+            }));
+        }
 
-        Ok(Some(IRStreamChunk {
-            message_id: chunk.id,
-            model: chunk.model,
-            chunk_type,
-        }))
+        Ok(chunks)
     }
 
     fn required_headers(&self, api_key: &str) -> Vec<(String, String)> {

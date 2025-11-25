@@ -73,8 +73,10 @@ pub trait BackendConverter: Send + Sync {
     /// Parse protocol-specific response bytes to IR
     async fn parse_response(&self, response_bytes: &[u8]) -> ConverterResult<IRResponse>;
 
-    /// Parse protocol-specific SSE event to IR chunk
-    fn parse_stream_chunk(&self, event_data: &[u8]) -> ConverterResult<Option<IRStreamChunk>>;
+    /// Parse protocol-specific SSE event to IR chunk(s)
+    /// Returns a vector to allow emitting multiple events from one backend chunk
+    /// (e.g., content_block_start + content_block_delta)
+    fn parse_stream_chunk(&self, event_data: &[u8]) -> ConverterResult<Vec<IRStreamChunk>>;
 
     /// Get required headers for this backend
     fn required_headers(&self, api_key: &str) -> Vec<(String, String)> {
@@ -134,20 +136,18 @@ where
 {
     use futures::StreamExt;
 
-    Box::pin(stream.filter_map(move |result| {
+    Box::pin(stream.flat_map(move |result| {
         let converter = converter.clone();
-        async move {
-            match result {
-                Ok(bytes) => {
-                    match converter.parse_stream_chunk(&bytes) {
-                        Ok(Some(chunk)) => Some(Ok(chunk)),
-                        Ok(None) => None, // Skip empty chunks
-                        Err(e) => Some(Err(e)),
-                    }
+        let chunks: Vec<ConverterResult<IRStreamChunk>> = match result {
+            Ok(bytes) => {
+                match converter.parse_stream_chunk(&bytes) {
+                    Ok(chunks) => chunks.into_iter().map(Ok).collect(),
+                    Err(e) => vec![Err(e)],
                 }
-                Err(e) => Some(Err(ProxyError::BackendError(e))),
             }
-        }
+            Err(e) => vec![Err(ProxyError::BackendError(e))],
+        };
+        futures::stream::iter(chunks)
     }))
 }
 

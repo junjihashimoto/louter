@@ -891,38 +891,43 @@ async fn stream_generate_content_impl(
 
             // Convert OpenAI SSE → IR chunks → Gemini SSE
             let logger = state.logger.clone();
-            let gemini_stream = openai_stream.filter_map(move |result| {
+            let gemini_stream = openai_stream.flat_map(move |result| {
                 let logger = logger.clone();
-                async move {
-                    // Create converters inside the async block (they're zero-sized types)
-                    let backend_converter = louter::ir::converters::openai_backend::OpenAIBackendConverter;
-                    let frontend_converter = louter::ir::converters::gemini_frontend::GeminiFrontendConverter::new();
+                // Create converters inside the closure (they're zero-sized types)
+                let backend_converter = louter::ir::converters::openai_backend::OpenAIBackendConverter;
+                let frontend_converter = louter::ir::converters::gemini_frontend::GeminiFrontendConverter::new();
 
-                    match result {
-                        Ok(openai_chunk) => {
-                            // Serialize OpenAI chunk to bytes
-                            if let Ok(chunk_bytes) = serde_json::to_vec(&openai_chunk) {
-                                // Parse OpenAI SSE chunk to IR
-                                if let Ok(ir_chunk) = backend_converter.parse_stream_chunk(&chunk_bytes) {
-                                    if let Some(chunk) = ir_chunk {
-                                        // Convert IR chunk to Gemini format
-                                        if let Ok(gemini_chunk_str) = frontend_converter.format_stream_chunk(&chunk) {
-                                            // Log the chunk
-                                            if let Some(ref logger) = logger {
-                                                if let Ok(chunk_json) = serde_json::from_str::<serde_json::Value>(&gemini_chunk_str) {
-                                                    logger.log_client_response("/v1beta/models/:streamGenerateContent", "gemini", &chunk_json);
-                                                }
+                let events: Vec<Result<axum::response::sse::Event, axum::Error>> = match result {
+                    Ok(openai_chunk) => {
+                        // Serialize OpenAI chunk to bytes
+                        if let Ok(chunk_bytes) = serde_json::to_vec(&openai_chunk) {
+                            // Parse OpenAI SSE chunk to IR chunks (may return multiple)
+                            if let Ok(ir_chunks) = backend_converter.parse_stream_chunk(&chunk_bytes) {
+                                // Convert each IR chunk to Gemini format
+                                ir_chunks.into_iter().filter_map(|chunk| {
+                                    if let Ok(gemini_chunk_str) = frontend_converter.format_stream_chunk(&chunk) {
+                                        // Log the chunk
+                                        if let Some(ref logger) = logger {
+                                            if let Ok(chunk_json) = serde_json::from_str::<serde_json::Value>(&gemini_chunk_str) {
+                                                logger.log_client_response("/v1beta/models/:streamGenerateContent", "gemini", &chunk_json);
                                             }
-                                            return Some(Ok(axum::response::sse::Event::default().data(gemini_chunk_str)));
                                         }
+                                        Some(Ok(axum::response::sse::Event::default().data(gemini_chunk_str)))
+                                    } else {
+                                        None
                                     }
-                                }
+                                }).collect()
+                            } else {
+                                vec![]
                             }
-                            None
-                        },
-                        Err(e) => Some(Err(axum::Error::new(e))),
-                    }
-                }
+                        } else {
+                            vec![]
+                        }
+                    },
+                    Err(e) => vec![Err(axum::Error::new(e))],
+                };
+
+                futures::stream::iter(events)
             });
 
             Ok(axum::response::Sse::new(gemini_stream).into_response())
@@ -952,43 +957,46 @@ async fn stream_generate_content_impl(
             // Convert Gemini backend SSE → IR chunks → Gemini frontend SSE
             let logger = state.logger.clone();
             let model_clone = model.clone();
-            let gemini_stream = gemini_backend_stream.filter_map(move |result| {
+            let gemini_stream = gemini_backend_stream.flat_map(move |result| {
                 let logger = logger.clone();
                 let model_clone = model_clone.clone();
-                async move {
-                    // Create converters inside the async block (they're zero-sized types)
-                    let backend_converter = louter::ir::converters::gemini_backend::GeminiBackendConverter;
-                    let frontend_converter = louter::ir::converters::gemini_frontend::GeminiFrontendConverter::new();
+                // Create converters (they're zero-sized types)
+                let backend_converter = louter::ir::converters::gemini_backend::GeminiBackendConverter;
+                let frontend_converter = louter::ir::converters::gemini_frontend::GeminiFrontendConverter::new();
 
-                    match result {
-                        Ok(line) => {
-                            // Log backend chunk
-                            if let Some(ref logger) = logger {
-                                if let Ok(chunk_json) = serde_json::from_str::<serde_json::Value>(&line) {
-                                    logger.log_backend_response(&format!("/v1beta/models/{}:streamGenerateContent", model_clone), "gemini", &chunk_json);
-                                }
+                let events: Vec<Result<axum::response::sse::Event, axum::Error>> = match result {
+                    Ok(line) => {
+                        // Log backend chunk
+                        if let Some(ref logger) = logger {
+                            if let Ok(chunk_json) = serde_json::from_str::<serde_json::Value>(&line) {
+                                logger.log_backend_response(&format!("/v1beta/models/{}:streamGenerateContent", model_clone), "gemini", &chunk_json);
                             }
+                        }
 
-                            // Parse Gemini backend SSE chunk to IR
-                            if let Ok(ir_chunk) = backend_converter.parse_stream_chunk(line.as_bytes()) {
-                                if let Some(chunk) = ir_chunk {
-                                    // Convert IR chunk back to Gemini frontend format
-                                    if let Ok(gemini_chunk_str) = frontend_converter.format_stream_chunk(&chunk) {
-                                        // Log client chunk
-                                        if let Some(ref logger) = logger {
-                                            if let Ok(chunk_json) = serde_json::from_str::<serde_json::Value>(&gemini_chunk_str) {
-                                                logger.log_client_response(&format!("/v1beta/models/{}:streamGenerateContent", model_clone), "gemini", &chunk_json);
-                                            }
+                        // Parse Gemini backend SSE chunk to IR chunks (may return multiple)
+                        if let Ok(ir_chunks) = backend_converter.parse_stream_chunk(line.as_bytes()) {
+                            ir_chunks.into_iter().filter_map(|chunk| {
+                                // Convert IR chunk back to Gemini frontend format
+                                if let Ok(gemini_chunk_str) = frontend_converter.format_stream_chunk(&chunk) {
+                                    // Log client chunk
+                                    if let Some(ref logger) = logger {
+                                        if let Ok(chunk_json) = serde_json::from_str::<serde_json::Value>(&gemini_chunk_str) {
+                                            logger.log_client_response(&format!("/v1beta/models/{}:streamGenerateContent", model_clone), "gemini", &chunk_json);
                                         }
-                                        return Some(Ok(axum::response::sse::Event::default().data(gemini_chunk_str)));
                                     }
+                                    Some(Ok(axum::response::sse::Event::default().data(gemini_chunk_str)))
+                                } else {
+                                    None
                                 }
-                            }
-                            None
-                        },
-                        Err(e) => Some(Err(axum::Error::new(e))),
-                    }
-                }
+                            }).collect()
+                        } else {
+                            vec![]
+                        }
+                    },
+                    Err(e) => vec![Err(axum::Error::new(e))],
+                };
+
+                futures::stream::iter(events)
             });
 
             Ok(axum::response::Sse::new(gemini_stream).into_response())
@@ -1404,42 +1412,44 @@ async fn handle_openai_chat_completions(
                 let backend_converter_arc = std::sync::Arc::new(backend_converter);
                 let original_model = request.model.clone();
 
-                let openai_stream = stream.map(move |response_result| {
-                    match response_result {
+                let openai_stream = stream.flat_map(move |response_result| {
+                    let frontend_converter_arc = frontend_converter_arc.clone();
+                    let backend_converter_arc = backend_converter_arc.clone();
+
+                    let events: Vec<Result<axum::response::sse::Event, std::io::Error>> = match response_result {
                         Ok(gemini_stream_response) => {
                             // Serialize Gemini stream response
                             let response_bytes = match serde_json::to_vec(&gemini_stream_response) {
                                 Ok(bytes) => bytes,
-                                Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
-                                    format!("Failed to serialize Gemini stream response: {}", e))),
+                                Err(e) => return futures::stream::iter(vec![Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                                    format!("Failed to serialize Gemini stream response: {}", e)))]),
                             };
 
-                            // Parse to IR chunk
-                            let ir_chunk_opt = match backend_converter_arc.parse_stream_chunk(&response_bytes) {
-                                Ok(opt) => opt,
-                                Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
-                                    format!("Failed to parse IR chunk: {}", e))),
+                            // Parse to IR chunks (may return multiple)
+                            let ir_chunks = match backend_converter_arc.parse_stream_chunk(&response_bytes) {
+                                Ok(chunks) => chunks,
+                                Err(e) => return futures::stream::iter(vec![Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                                    format!("Failed to parse IR chunk: {}", e)))]),
                             };
 
-                            // Convert IR chunk to OpenAI SSE if present
-                            if let Some(ir_chunk) = ir_chunk_opt {
+                            // Convert each IR chunk to OpenAI SSE
+                            ir_chunks.into_iter().filter_map(|ir_chunk| {
                                 match frontend_converter_arc.format_stream_chunk(&ir_chunk) {
                                     Ok(sse_data) => {
                                         if sse_data.is_empty() {
-                                            Ok(axum::response::sse::Event::default().comment("skipped"))
+                                            None  // Skip empty
                                         } else {
-                                            Ok(axum::response::sse::Event::default().data(sse_data))
+                                            Some(Ok(axum::response::sse::Event::default().data(sse_data)))
                                         }
                                     },
-                                    Err(e) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
+                                    Err(e) => Some(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))),
                                 }
-                            } else {
-                                // Skip if no IR chunk
-                                Ok(axum::response::sse::Event::default().comment("skipped"))
-                            }
+                            }).collect()
                         },
-                        Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
-                    }
+                        Err(e) => vec![Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))],
+                    };
+
+                    futures::stream::iter(events)
                 });
 
                 Ok(axum::response::Sse::new(openai_stream).into_response())
@@ -1489,6 +1499,32 @@ async fn handle_openai_chat_completions(
     }
 }
 
+// Helper function to parse SSE string to Axum SSE Event
+fn parse_sse_to_axum_event(sse_string: String) -> Result<axum::response::sse::Event, std::io::Error> {
+    // The converter returns full SSE format (event: X\ndata: Y\n\n)
+    // Parse event type and data from the SSE string
+    let mut event_type = None;
+    let mut data_parts = Vec::new();
+
+    for line in sse_string.lines() {
+        if let Some(event_name) = line.strip_prefix("event: ") {
+            event_type = Some(event_name.to_string());
+        } else if let Some(data_content) = line.strip_prefix("data: ") {
+            data_parts.push(data_content.to_string());
+        }
+    }
+
+    let mut event = axum::response::sse::Event::default();
+    if let Some(event_name) = event_type {
+        event = event.event(event_name);
+    }
+    if !data_parts.is_empty() {
+        event = event.data(data_parts.join("\n"));
+    }
+
+    Ok(event)
+}
+
 // Anthropic (Claude) API endpoint
 async fn handle_anthropic_messages(
     State(state): State<AppState>,
@@ -1496,6 +1532,7 @@ async fn handle_anthropic_messages(
     Json(request): Json<louter::models::anthropic::MessagesRequest>,
 ) -> Result<Response, ProxyError> {
     use louter::ir::traits::{FrontendConverter, BackendConverter};
+    use louter::ir::types::{IRChunkType, IRStreamChunk, IRContentBlockStart};
 
     let start_time = Instant::now();
     let original_model = request.model.clone();
@@ -1725,61 +1762,75 @@ async fn handle_anthropic_messages(
         let backend_converter_arc = std::sync::Arc::new(backend_converter);
         let original_model_clone = original_model.clone();
 
+        // Track if we've emitted content_block_start to avoid duplicates
+        let content_block_started = std::sync::Arc::new(std::sync::Mutex::new(false));
+
         // Convert OpenAI stream responses to IR chunks, then to Anthropic SSE
-        let anthropic_stream = stream.map(move |response_result| {
-            match response_result {
+        let anthropic_stream = stream.flat_map(move |response_result| {
+            let frontend_converter_arc = frontend_converter_arc.clone();
+            let backend_converter_arc = backend_converter_arc.clone();
+            let content_block_started = content_block_started.clone();
+
+            let events: Vec<Result<axum::response::sse::Event, std::io::Error>> = match response_result {
                 Ok(openai_stream_response) => {
                     // Serialize OpenAI stream response
                     let response_bytes = match serde_json::to_vec(&openai_stream_response) {
                         Ok(bytes) => bytes,
-                        Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
-                            format!("Failed to serialize OpenAI stream response: {}", e))),
+                        Err(e) => return futures::stream::iter(vec![Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                            format!("Failed to serialize OpenAI stream response: {}", e)))]),
                     };
 
-                    // Parse to IR chunk
-                    let ir_chunk_opt = match backend_converter_arc.parse_stream_chunk(&response_bytes) {
-                        Ok(opt) => opt,
-                        Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
-                            format!("Failed to parse IR chunk: {}", e))),
+                    // Parse to IR chunks (may return multiple)
+                    let ir_chunks = match backend_converter_arc.parse_stream_chunk(&response_bytes) {
+                        Ok(chunks) => chunks,
+                        Err(e) => return futures::stream::iter(vec![Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                            format!("Failed to parse IR chunk: {}", e)))]),
                     };
 
-                    // Convert IR chunk to Anthropic SSE if present
-                    if let Some(ir_chunk) = ir_chunk_opt {
+                    // Convert each IR chunk to Anthropic SSE
+                    // Track if we need to inject content_block_start
+                    let mut result_events = Vec::new();
+
+                    for ir_chunk in ir_chunks {
+                        // Check if this is a content_block_delta and we haven't started yet
+                        if matches!(ir_chunk.chunk_type, IRChunkType::ContentBlockDelta { .. }) {
+                            let mut started = content_block_started.lock().unwrap();
+                            if !*started {
+                                // Inject content_block_start before first delta
+                                *started = true;
+                                drop(started);  // Release lock
+
+                                let start_chunk = IRStreamChunk {
+                                    message_id: ir_chunk.message_id.clone(),
+                                    model: ir_chunk.model.clone(),
+                                    chunk_type: IRChunkType::ContentBlockStart {
+                                        index: 0,
+                                        content_block: IRContentBlockStart::Text,
+                                    },
+                                };
+
+                                if let Ok(sse_string) = frontend_converter_arc.format_stream_chunk(&start_chunk) {
+                                    result_events.push(parse_sse_to_axum_event(sse_string));
+                                }
+                            }
+                        }
+
                         match frontend_converter_arc.format_stream_chunk(&ir_chunk) {
                             Ok(sse_string) => {
-                                // The converter returns full SSE format (event: X\ndata: Y\n\n)
-                                // We need to parse it and build proper Axum SSE Event
-                                // Parse event type and data from the SSE string
-                                let mut event_type = None;
-                                let mut data_parts = Vec::new();
-
-                                for line in sse_string.lines() {
-                                    if let Some(event_name) = line.strip_prefix("event: ") {
-                                        event_type = Some(event_name.to_string());
-                                    } else if let Some(data_content) = line.strip_prefix("data: ") {
-                                        data_parts.push(data_content.to_string());
-                                    }
-                                }
-
-                                let mut event = axum::response::sse::Event::default();
-                                if let Some(event_name) = event_type {
-                                    event = event.event(event_name);
-                                }
-                                if !data_parts.is_empty() {
-                                    event = event.data(data_parts.join("\n"));
-                                }
-
-                                Ok(event)
+                                result_events.push(parse_sse_to_axum_event(sse_string));
                             },
-                            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
+                            Err(e) => {
+                                result_events.push(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())));
+                            }
                         }
-                    } else {
-                        // Skip if no IR chunk (e.g., empty delta)
-                        Ok(axum::response::sse::Event::default().comment("skipped"))
                     }
+
+                    result_events
                 },
-                Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
-            }
+                Err(e) => vec![Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))],
+            };
+
+            futures::stream::iter(events)
         });
 
         Ok(axum::response::Sse::new(anthropic_stream).into_response())

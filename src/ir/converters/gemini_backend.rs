@@ -138,20 +138,29 @@ impl BackendConverter for GeminiBackendConverter {
         })
     }
 
-    fn parse_stream_chunk(&self, event_data: &[u8]) -> ConverterResult<Option<IRStreamChunk>> {
+    fn parse_stream_chunk(&self, event_data: &[u8]) -> ConverterResult<Vec<IRStreamChunk>> {
         // Try to parse as Gemini stream response
         let stream_response: GeminiStreamResponse = match serde_json::from_slice(event_data) {
             Ok(r) => r,
-            Err(_) => return Ok(None), // Skip invalid chunks
+            Err(_) => return Ok(vec![]), // Skip invalid chunks
         };
 
         let candidate = match stream_response.candidates.first() {
             Some(c) => c,
-            None => return Ok(None),
+            None => return Ok(vec![]),
         };
 
+        // Helper to create chunk
+        let make_chunk = |chunk_type: IRChunkType| IRStreamChunk {
+            message_id: format!("gemini-stream-{}", uuid::Uuid::new_v4()),
+            model: "gemini".to_string(),
+            chunk_type,
+        };
+
+        let mut chunks = Vec::new();
+
         // Determine chunk type based on content
-        let chunk_type = if let Some(finish_reason) = &candidate.finish_reason {
+        if let Some(finish_reason) = &candidate.finish_reason {
             // Message delta with stop reason, then stop
             let usage = stream_response.usage_metadata.as_ref().map(|u| IRUsage {
                 input_tokens: u.prompt_token_count,
@@ -168,27 +177,20 @@ impl BackendConverter for GeminiBackendConverter {
             });
 
             let stop_reason = convert_gemini_finish_reason_to_ir(finish_reason);
-            IRChunkType::MessageDelta {
+            chunks.push(make_chunk(IRChunkType::MessageDelta {
                 delta: IRMessageDelta {
                     stop_reason,
                     stop_sequence: None,
                 },
                 usage,
-            }
+            }));
         } else if !candidate.content.parts.is_empty() {
             // Content delta
             let delta = convert_gemini_parts_to_delta(&candidate.content.parts)?;
-            IRChunkType::ContentBlockDelta { index: 0, delta }
-        } else {
-            // Unknown chunk type
-            return Ok(None);
-        };
+            chunks.push(make_chunk(IRChunkType::ContentBlockDelta { index: 0, delta }));
+        }
 
-        Ok(Some(IRStreamChunk {
-            message_id: format!("gemini-stream-{}", uuid::Uuid::new_v4()),
-            model: "gemini".to_string(),
-            chunk_type,
-        }))
+        Ok(chunks)
     }
 
     fn required_headers(&self, api_key: &str) -> Vec<(String, String)> {
