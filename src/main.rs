@@ -339,18 +339,54 @@ async fn generate_content_impl(
     headers: HeaderMap,
     request: louter::models::gemini::GeminiRequest,
 ) -> Result<Response, ProxyError> {
+    use louter::ir::traits::{FrontendConverter, BackendConverter};
+
     let start_time = Instant::now();
     let endpoint = format!("/v1beta/models/{}:generateContent", model);
+    let original_model = request.contents.first()
+        .and_then(|c| c.parts.first())
+        .map(|_| model.clone())
+        .unwrap_or_else(|| model.clone());
 
-    info!("Generate content request for model: {} (backend: {})", model, state.backend_type);
+    // Generate unique request ID for correlation
+    let request_id = uuid::Uuid::new_v4().to_string();
+
+    info!("Generate content request for model: {} (request_id: {})", model, request_id);
     debug!("Request body: {}", serde_json::to_string_pretty(&request).unwrap_or_else(|e| format!("Failed to serialize request: {}", e)));
 
-    // Log client request
+    // Log client request with full details
     if let Some(logger) = &state.logger {
         if let Ok(request_json) = serde_json::to_value(&request) {
-            logger.log_client_request(&endpoint, "gemini", &request_json);
+            // Capture headers
+            let mut headers_map = std::collections::HashMap::new();
+            for (key, value) in headers.iter() {
+                if let Ok(value_str) = value.to_str() {
+                    headers_map.insert(key.to_string(), value_str.to_string());
+                }
+            }
+
+            logger.log_client_request_detailed(
+                &endpoint,
+                "gemini",
+                &request_json,
+                "POST",
+                headers_map,
+                request_id.clone(),
+                false, // Non-streaming
+            );
         }
     }
+
+    // Helper to classify error type
+    let error_type_from_error = |error: &ProxyError| -> &str {
+        match error {
+            ProxyError::InvalidRequest(_) => "invalid_request",
+            ProxyError::BackendError(_) => "backend_error",
+            ProxyError::ConversionError(_) => "conversion_error",
+            ProxyError::ConfigError(_) => "config_error",
+            ProxyError::SerializationError(_) => "serialization_error",
+        }
+    };
 
     // Content-based routing: Detect required capabilities from Gemini request
     let required_caps = routing::detect_capabilities_gemini(&request);
@@ -456,14 +492,113 @@ async fn generate_content_impl(
         state.backend_type.as_str()
     };
 
+    // Use IR architecture for conversion
+    let frontend_converter = louter::ir::converters::gemini_frontend::GeminiFrontendConverter::new();
+
+    // Serialize Gemini request to bytes
+    let request_bytes = match serde_json::to_vec(&request) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let error = ProxyError::SerializationError(e);
+            if let Some(logger) = &state.logger {
+                if let Ok(request_json) = serde_json::to_value(&request) {
+                    logger.log_error(
+                        &endpoint,
+                        "gemini",
+                        &error.to_string(),
+                        "serialization_error",
+                        Some(&request_json),
+                        Some(request_id.clone()),
+                        None,
+                    );
+                }
+            }
+            return Err(error);
+        }
+    };
+
+    // Parse Gemini request to IR
+    let mut ir_request = match frontend_converter.parse_request(&request_bytes).await {
+        Ok(ir) => ir,
+        Err(e) => {
+            if let Some(logger) = &state.logger {
+                if let Ok(request_json) = serde_json::to_value(&request) {
+                    logger.log_error(
+                        &endpoint,
+                        "gemini",
+                        &e.to_string(),
+                        error_type_from_error(&e),
+                        Some(&request_json),
+                        Some(request_id.clone()),
+                        None,
+                    );
+                }
+            }
+            return Err(e);
+        }
+    };
+
+    // Set the model in IR request
+    ir_request.model = model.clone();
+
     let result = match backend_protocol_type {
         "openai" => {
-            // OpenAI backend: Convert Gemini request to OpenAI format
-            // Use selected_backend for API key lookup (supports routing)
+            // OpenAI backend: Convert IR to OpenAI format using backend converter
+            let backend_converter = louter::ir::converters::openai_backend::OpenAIBackendConverter;
+
             let openai_api_key = state.config.get_api_key(&selected_backend, "OPENAI_API_KEY")
                 .ok_or_else(|| ProxyError::ConfigError(format!("API key not found for backend '{}' in config or OPENAI_API_KEY environment variable", selected_backend)))?;
 
-            let openai_request = conversion::gemini_to_openai_request(request, &model, &selected_backend, &state.config)?;
+            // Format IR to OpenAI request
+            let openai_request_bytes = match backend_converter.format_request(&ir_request).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    if let Some(logger) = &state.logger {
+                        if let Ok(request_json) = serde_json::to_value(&request) {
+                            logger.log_error(
+                                &endpoint,
+                                "gemini",
+                                &e.to_string(),
+                                error_type_from_error(&e),
+                                Some(&request_json),
+                                Some(request_id.clone()),
+                                None,
+                            );
+                        }
+                    }
+                    return Err(e);
+                }
+            };
+
+            // Deserialize OpenAI request
+            let mut openai_request: louter::models::openai::OpenAIRequest = match serde_json::from_slice(&openai_request_bytes) {
+                Ok(req) => req,
+                Err(e) => {
+                    let error = ProxyError::SerializationError(e);
+                    if let Some(logger) = &state.logger {
+                        if let Ok(request_json) = serde_json::to_value(&request) {
+                            logger.log_error(
+                                &endpoint,
+                                "gemini",
+                                &error.to_string(),
+                                "serialization_error",
+                                Some(&request_json),
+                                Some(request_id.clone()),
+                                None,
+                            );
+                        }
+                    }
+                    return Err(error);
+                }
+            };
+
+            // Apply backend-specific model mapping
+            if let Some(backend_config) = state.config.backends.get(&selected_backend) {
+                if let Some(backend_model) = backend_config.model_mapping.get(&model) {
+                    openai_request.model = backend_model.clone();
+                    info!("Model mapping: '{}' → '{}'", model, backend_model);
+                }
+            }
 
             // Log the OpenAI request for debugging
             if state.verbose {
@@ -491,7 +626,16 @@ async fn generate_content_impl(
                 }
             }
 
-            let gemini_response = conversion::openai_to_gemini_response(openai_response.clone())?;
+            // Convert OpenAI response to IR
+            let openai_response_bytes = serde_json::to_vec(&openai_response)
+                .map_err(|e| ProxyError::SerializationError(e))?;
+
+            let ir_response = backend_converter.parse_response(&openai_response_bytes).await?;
+
+            // Convert IR response to Gemini format
+            let gemini_response_bytes = frontend_converter.format_response(&ir_response).await?;
+            let gemini_response: louter::models::gemini::GeminiResponse = serde_json::from_slice(&gemini_response_bytes)
+                .map_err(|e| ProxyError::SerializationError(e))?;
 
             // Calculate metrics
             let e2e_latency_ms = start_time.elapsed().as_secs_f64() * 1000.0;
@@ -507,7 +651,7 @@ async fn generate_content_impl(
             if let Some(logger) = &state.logger {
                 if let Ok(response_json) = serde_json::to_value(&gemini_response) {
                     logger.log_client_response_with_metrics(
-                        &format!("/v1beta/models/{}:generateContent", model),
+                        &endpoint,
                         "gemini",
                         &response_json,
                         ttft_ms,
@@ -557,18 +701,44 @@ async fn generate_content_impl(
             Ok(Json(gemini_response).into_response())
         },
         "gemini" => {
-            // Gemini backend: Pass-through mode - forward directly to Gemini API
-            let gemini_api_key = state.config.get_api_key("gemini", "GEMINI_API_KEY")
-                .ok_or_else(|| ProxyError::ConfigError("Gemini API key not found in config or GEMINI_API_KEY environment variable".to_string()))?;
+            // Gemini backend: Convert IR to Gemini format using backend converter
+            let backend_converter = louter::ir::converters::gemini_backend::GeminiBackendConverter;
 
-            // Log backend request (same as client request in pass-through mode)
+            let gemini_api_key = state.config.get_api_key(&selected_backend, "GEMINI_API_KEY")
+                .ok_or_else(|| ProxyError::ConfigError(format!("Gemini API key not found for backend '{}' in config or GEMINI_API_KEY environment variable", selected_backend)))?;
+
+            // Format IR to Gemini request
+            let backend_request_bytes = match backend_converter.format_request(&ir_request).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    if let Some(logger) = &state.logger {
+                        if let Ok(request_json) = serde_json::to_value(&request) {
+                            logger.log_error(
+                                &endpoint,
+                                "gemini",
+                                &e.to_string(),
+                                error_type_from_error(&e),
+                                Some(&request_json),
+                                Some(request_id.clone()),
+                                None,
+                            );
+                        }
+                    }
+                    return Err(e);
+                }
+            };
+
+            let backend_request: louter::models::gemini::GeminiRequest = serde_json::from_slice(&backend_request_bytes)
+                .map_err(|e| ProxyError::SerializationError(e))?;
+
+            // Log backend request
             if let Some(logger) = &state.logger {
-                if let Ok(request_json) = serde_json::to_value(&request) {
+                if let Ok(request_json) = serde_json::to_value(&backend_request) {
                     logger.log_backend_request(&format!("/v1beta/models/{}:generateContent", model), "gemini", &request_json);
                 }
             }
 
-            let gemini_response = state.backend_client.gemini_generate_content(request, &model, &gemini_api_key).await?;
+            let gemini_response = state.backend_client.gemini_generate_content(backend_request, &model, &gemini_api_key).await?;
 
             // Log backend response
             if let Some(logger) = &state.logger {
@@ -577,17 +747,26 @@ async fn generate_content_impl(
                 }
             }
 
-            // Log client response (same as backend response in pass-through mode)
+            // Convert Gemini response to IR and back to Gemini (for consistency)
+            let gemini_response_bytes = serde_json::to_vec(&gemini_response)
+                .map_err(|e| ProxyError::SerializationError(e))?;
+
+            let ir_response = backend_converter.parse_response(&gemini_response_bytes).await?;
+            let final_response_bytes = frontend_converter.format_response(&ir_response).await?;
+            let final_response: louter::models::gemini::GeminiResponse = serde_json::from_slice(&final_response_bytes)
+                .map_err(|e| ProxyError::SerializationError(e))?;
+
+            // Log client response
             if let Some(logger) = &state.logger {
-                if let Ok(response_json) = serde_json::to_value(&gemini_response) {
-                    logger.log_client_response(&format!("/v1beta/models/{}:generateContent", model), "gemini", &response_json);
+                if let Ok(response_json) = serde_json::to_value(&final_response) {
+                    logger.log_client_response(&endpoint, "gemini", &response_json);
                 }
             }
 
-            Ok(Json(gemini_response).into_response())
+            Ok(Json(final_response).into_response())
         },
         _ => {
-            Err(ProxyError::ConfigError(format!("Unsupported backend type: {}", state.backend_type)))
+            Err(ProxyError::ConfigError(format!("Unsupported backend type: {}", backend_protocol_type)))
         }
     };
 
