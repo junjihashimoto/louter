@@ -858,6 +858,8 @@ async fn handle_openai_chat_completions(
     _headers: HeaderMap,
     Json(request): Json<louter::models::openai::OpenAIRequest>,
 ) -> Result<Response, ProxyError> {
+    use louter::ir::traits::{FrontendConverter, BackendConverter};
+
     let start_time = Instant::now();
 
     info!("OpenAI chat completions request for model: {}", request.model);
