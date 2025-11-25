@@ -1532,7 +1532,7 @@ async fn handle_anthropic_messages(
     Json(request): Json<louter::models::anthropic::MessagesRequest>,
 ) -> Result<Response, ProxyError> {
     use louter::ir::traits::{FrontendConverter, BackendConverter};
-    use louter::ir::types::{IRChunkType, IRStreamChunk, IRContentBlockStart};
+    use louter::ir::types::{IRChunkType, IRStreamChunk, IRContentBlockStart, IRDelta};
 
     let start_time = Instant::now();
     let original_model = request.model.clone();
@@ -1765,11 +1765,15 @@ async fn handle_anthropic_messages(
         // Track if we've emitted content_block_start to avoid duplicates
         let content_block_started = std::sync::Arc::new(std::sync::Mutex::new(false));
 
+        // Buffer for incomplete JSON deltas (for tool inputs)
+        let json_buffer = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+
         // Convert OpenAI stream responses to IR chunks, then to Anthropic SSE
         let anthropic_stream = stream.flat_map(move |response_result| {
             let frontend_converter_arc = frontend_converter_arc.clone();
             let backend_converter_arc = backend_converter_arc.clone();
             let content_block_started = content_block_started.clone();
+            let json_buffer = json_buffer.clone();
 
             let events: Vec<Result<axum::response::sse::Event, std::io::Error>> = match response_result {
                 Ok(openai_stream_response) => {
@@ -1791,9 +1795,19 @@ async fn handle_anthropic_messages(
                     // Track if we need to inject content_block_start
                     let mut result_events = Vec::new();
 
+                    // Check if this batch has a ContentBlockStart already
+                    let has_block_start = ir_chunks.iter().any(|c| matches!(c.chunk_type, IRChunkType::ContentBlockStart { .. }));
+
                     for ir_chunk in ir_chunks {
+                        // Reset flag on message_start
+                        if matches!(ir_chunk.chunk_type, IRChunkType::MessageStart { .. }) {
+                            let mut started = content_block_started.lock().unwrap();
+                            *started = false;
+                        }
+
                         // Check if this is a content_block_delta and we haven't started yet
-                        if matches!(ir_chunk.chunk_type, IRChunkType::ContentBlockDelta { .. }) {
+                        // AND this batch doesn't already have a ContentBlockStart
+                        if matches!(ir_chunk.chunk_type, IRChunkType::ContentBlockDelta { .. }) && !has_block_start {
                             let mut started = content_block_started.lock().unwrap();
                             if !*started {
                                 // Inject content_block_start before first delta
@@ -1815,12 +1829,66 @@ async fn handle_anthropic_messages(
                             }
                         }
 
-                        match frontend_converter_arc.format_stream_chunk(&ir_chunk) {
-                            Ok(sse_string) => {
-                                result_events.push(parse_sse_to_axum_event(sse_string));
-                            },
-                            Err(e) => {
-                                result_events.push(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())));
+                        // Mark as started when we see ContentBlockStart
+                        if matches!(ir_chunk.chunk_type, IRChunkType::ContentBlockStart { .. }) {
+                            let mut started = content_block_started.lock().unwrap();
+                            *started = true;
+                            // Clear JSON buffer on new content block
+                            let mut buffer = json_buffer.lock().unwrap();
+                            buffer.clear();
+                        }
+
+                        // Handle InputJsonDelta buffering to fix malformed JSON from backends
+                        let chunk_to_emit = if let IRChunkType::ContentBlockDelta { index, delta: IRDelta::InputJsonDelta { partial_json } } = &ir_chunk.chunk_type {
+                            let mut buffer = json_buffer.lock().unwrap();
+                            buffer.push_str(partial_json);
+
+                            // Check if buffer needs fixing (missing opening brace/quote)
+                            let trimmed = buffer.trim();
+                            if !trimmed.is_empty() && !trimmed.starts_with('{') {
+                                // llama.cpp sends: expression":"value"}
+                                // We need: {"expression":"value"}
+                                // Insert both { and " at the start
+                                buffer.insert_str(0, "{\"");
+                            }
+
+                            // Check if we have complete JSON (ends with '}')
+                            let has_closing_brace = buffer.trim().ends_with('}');
+
+                            // Only emit if we have closing brace
+                            if has_closing_brace {
+                                // Emit the complete JSON
+                                let complete_json = buffer.clone();
+                                buffer.clear();
+
+                                Some(IRStreamChunk {
+                                    message_id: ir_chunk.message_id.clone(),
+                                    model: ir_chunk.model.clone(),
+                                    chunk_type: IRChunkType::ContentBlockDelta {
+                                        index: *index,
+                                        delta: IRDelta::InputJsonDelta {
+                                            partial_json: complete_json,
+                                        },
+                                    },
+                                })
+                            } else {
+                                // Still buffering, don't emit yet
+                                None
+                            }
+                        } else {
+                            // Not a JSON delta, emit as-is
+                            Some(ir_chunk)
+                        };
+
+                        // Emit the chunk if we have one
+                        if let Some(chunk) = chunk_to_emit {
+                            match frontend_converter_arc.format_stream_chunk(&chunk) {
+                                Ok(sse_string) => {
+                                    result_events.push(parse_sse_to_axum_event(sse_string));
+                                },
+                                Err(e) => {
+                                    result_events.push(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())));
+                                }
                             }
                         }
                     }

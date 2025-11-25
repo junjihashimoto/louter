@@ -187,7 +187,8 @@ impl BackendConverter for OpenAIBackendConverter {
             // Tool call delta
             if let Some(tool_call) = tool_calls.first() {
                 if let Some(name) = &tool_call.function.name {
-                    // Start of tool call
+                    // Start of tool call - emit content_block_start
+                    // (The wrapper in main.rs will track this separately from text blocks)
                     chunks.push(make_chunk(IRChunkType::ContentBlockStart {
                         index: tool_call.index.unwrap_or(0),
                         content_block: IRContentBlockStart::ToolUse {
