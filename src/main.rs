@@ -786,12 +786,20 @@ async fn generate_content_impl(
 async fn stream_generate_content_impl(
     state: AppState,
     model: String,
-    _params: std::collections::HashMap<String, String>,
+    params: std::collections::HashMap<String, String>,
     _headers: HeaderMap,
     request: louter::models::gemini::GeminiRequest,
 ) -> Result<Response, ProxyError> {
     use louter::ir::traits::{FrontendConverter, BackendConverter};
     use futures_util::StreamExt;
+
+    // Detect streaming format based on query parameters
+    // - alt=sse → SSE format (gemini-cli)
+    // - $alt=json → JSON array (Python SDK)
+    // - none → NDJSON (default)
+    let alt_param = params.get("alt").or_else(|| params.get("$alt"));
+    let use_sse = alt_param.as_ref().map(|v| v.contains("sse")).unwrap_or(false);
+    let use_json_array = alt_param.as_ref().map(|v| v.contains("json")).unwrap_or(false);
 
     let endpoint = format!("/v1beta/models/{}:streamGenerateContent", model);
 
@@ -897,7 +905,7 @@ async fn stream_generate_content_impl(
                 let backend_converter = louter::ir::converters::openai_backend::OpenAIBackendConverter;
                 let frontend_converter = louter::ir::converters::gemini_frontend::GeminiFrontendConverter::new();
 
-                let events: Vec<Result<axum::response::sse::Event, axum::Error>> = match result {
+                let events: Vec<Result<String, axum::Error>> = match result {
                     Ok(openai_chunk) => {
                         // Serialize OpenAI chunk to bytes
                         if let Ok(chunk_bytes) = serde_json::to_vec(&openai_chunk) {
@@ -906,13 +914,23 @@ async fn stream_generate_content_impl(
                                 // Convert each IR chunk to Gemini format
                                 ir_chunks.into_iter().filter_map(|chunk| {
                                     if let Ok(gemini_chunk_str) = frontend_converter.format_stream_chunk(&chunk) {
+                                        // Skip chunks with empty candidates (including initial metadata chunk)
+                                        if gemini_chunk_str.contains(r#""candidates":[]"#) {
+                                            return None;
+                                        }
+                                        // Skip chunks with empty parts (including final finish chunk)
+                                        if gemini_chunk_str.contains(r#""parts":[]"#) {
+                                            return None;
+                                        }
+
                                         // Log the chunk
                                         if let Some(ref logger) = logger {
                                             if let Ok(chunk_json) = serde_json::from_str::<serde_json::Value>(&gemini_chunk_str) {
                                                 logger.log_client_response("/v1beta/models/:streamGenerateContent", "gemini", &chunk_json);
                                             }
                                         }
-                                        Some(Ok(axum::response::sse::Event::default().data(gemini_chunk_str)))
+                                        // Gemini uses NDJSON format (newline-delimited JSON), not SSE
+                                        Some(Ok(format!("{}\n", gemini_chunk_str)))
                                     } else {
                                         None
                                     }
@@ -930,7 +948,53 @@ async fn stream_generate_content_impl(
                 futures::stream::iter(events)
             });
 
-            Ok(axum::response::Sse::new(gemini_stream).into_response())
+            // Gemini streaming format depends on client:
+            // - SSE format with data: prefix (gemini-cli with alt=sse)
+            // - JSON array (Python SDK with $alt=json)
+            // - NDJSON (default)
+            use futures_util::TryStreamExt;
+
+            if use_sse {
+                // SSE format for gemini-cli
+                let sse_stream = gemini_stream.map(|result| {
+                    result.map(|s| {
+                        axum::response::sse::Event::default()
+                            .data(s.trim_end_matches('\n'))
+                    })
+                });
+                Ok(axum::response::Sse::new(sse_stream).into_response())
+            } else {
+                // JSON array or NDJSON
+                use axum::body::Body;
+
+                let final_stream = if use_json_array {
+                    // Wrap in JSON array for Python SDK
+                    let wrapped = futures_util::stream::once(async { Ok::<_, axum::Error>("[".to_string()) })
+                        .chain(gemini_stream.enumerate().map(|(i, result)| {
+                            result.map(|s| {
+                                if i == 0 {
+                                    format!("{}", s.trim_end_matches('\n'))
+                                } else {
+                                    format!(",{}", s.trim_end_matches('\n'))
+                                }
+                            })
+                        }))
+                        .chain(futures_util::stream::once(async { Ok("]".to_string()) }));
+                    Box::pin(wrapped) as std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<String, axum::Error>> + Send>>
+                } else {
+                    // NDJSON for default
+                    Box::pin(gemini_stream) as std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<String, axum::Error>> + Send>>
+                };
+
+                let byte_stream = final_stream.map_ok(|s: String| axum::body::Bytes::from(s));
+                let body = Body::from_stream(byte_stream);
+
+                Ok(axum::response::Response::builder()
+                    .header("Content-Type", "application/json")
+                    .header("Transfer-Encoding", "chunked")
+                    .body(body)
+                    .unwrap())
+            }
         },
         "gemini" => {
             // Gemini backend: Stream through IR converters (for consistency)
@@ -964,7 +1028,7 @@ async fn stream_generate_content_impl(
                 let backend_converter = louter::ir::converters::gemini_backend::GeminiBackendConverter;
                 let frontend_converter = louter::ir::converters::gemini_frontend::GeminiFrontendConverter::new();
 
-                let events: Vec<Result<axum::response::sse::Event, axum::Error>> = match result {
+                let events: Vec<Result<String, axum::Error>> = match result {
                     Ok(line) => {
                         // Log backend chunk
                         if let Some(ref logger) = logger {
@@ -978,13 +1042,23 @@ async fn stream_generate_content_impl(
                             ir_chunks.into_iter().filter_map(|chunk| {
                                 // Convert IR chunk back to Gemini frontend format
                                 if let Ok(gemini_chunk_str) = frontend_converter.format_stream_chunk(&chunk) {
+                                    // Skip chunks with empty candidates (including initial metadata chunk)
+                                    if gemini_chunk_str.contains(r#""candidates":[]"#) {
+                                        return None;
+                                    }
+                                    // Skip chunks with empty parts (including final finish chunk)
+                                    if gemini_chunk_str.contains(r#""parts":[]"#) {
+                                        return None;
+                                    }
+
                                     // Log client chunk
                                     if let Some(ref logger) = logger {
                                         if let Ok(chunk_json) = serde_json::from_str::<serde_json::Value>(&gemini_chunk_str) {
                                             logger.log_client_response(&format!("/v1beta/models/{}:streamGenerateContent", model_clone), "gemini", &chunk_json);
                                         }
                                     }
-                                    Some(Ok(axum::response::sse::Event::default().data(gemini_chunk_str)))
+                                    // Gemini uses NDJSON format (newline-delimited JSON), not SSE
+                                    Some(Ok(format!("{}\n", gemini_chunk_str)))
                                 } else {
                                     None
                                 }
@@ -999,7 +1073,53 @@ async fn stream_generate_content_impl(
                 futures::stream::iter(events)
             });
 
-            Ok(axum::response::Sse::new(gemini_stream).into_response())
+            // Gemini streaming format depends on client:
+            // - SSE format with data: prefix (gemini-cli with alt=sse)
+            // - JSON array (Python SDK with $alt=json)
+            // - NDJSON (default)
+            use futures_util::TryStreamExt;
+
+            if use_sse {
+                // SSE format for gemini-cli
+                let sse_stream = gemini_stream.map(|result| {
+                    result.map(|s| {
+                        axum::response::sse::Event::default()
+                            .data(s.trim_end_matches('\n'))
+                    })
+                });
+                Ok(axum::response::Sse::new(sse_stream).into_response())
+            } else {
+                // JSON array or NDJSON
+                use axum::body::Body;
+
+                let final_stream = if use_json_array {
+                    // Wrap in JSON array for Python SDK
+                    let wrapped = futures_util::stream::once(async { Ok::<_, axum::Error>("[".to_string()) })
+                        .chain(gemini_stream.enumerate().map(|(i, result)| {
+                            result.map(|s| {
+                                if i == 0 {
+                                    format!("{}", s.trim_end_matches('\n'))
+                                } else {
+                                    format!(",{}", s.trim_end_matches('\n'))
+                                }
+                            })
+                        }))
+                        .chain(futures_util::stream::once(async { Ok("]".to_string()) }));
+                    Box::pin(wrapped) as std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<String, axum::Error>> + Send>>
+                } else {
+                    // NDJSON for default
+                    Box::pin(gemini_stream) as std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<String, axum::Error>> + Send>>
+                };
+
+                let byte_stream = final_stream.map_ok(|s: String| axum::body::Bytes::from(s));
+                let body = Body::from_stream(byte_stream);
+
+                Ok(axum::response::Response::builder()
+                    .header("Content-Type", "application/json")
+                    .header("Transfer-Encoding", "chunked")
+                    .body(body)
+                    .unwrap())
+            }
         },
         _ => {
             Err(ProxyError::ConfigError(format!("Unsupported backend type: {}", backend_protocol_type)))
