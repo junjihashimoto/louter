@@ -786,44 +786,54 @@ async fn generate_content_impl(
 async fn stream_generate_content_impl(
     state: AppState,
     model: String,
-    params: std::collections::HashMap<String, String>,
-    headers: HeaderMap,
+    _params: std::collections::HashMap<String, String>,
+    _headers: HeaderMap,
     request: louter::models::gemini::GeminiRequest,
 ) -> Result<Response, ProxyError> {
-    info!("Stream generate content request for model: {} (backend: {})", model, state.backend_type);
+    use louter::ir::traits::{FrontendConverter, BackendConverter};
+    use futures_util::StreamExt;
+
+    let endpoint = format!("/v1beta/models/{}:streamGenerateContent", model);
+
+    info!("Stream generate content request for model: {}", model);
     debug!("Stream request body: {}", serde_json::to_string_pretty(&request).unwrap_or_else(|e| format!("Failed to serialize request: {}", e)));
 
+    // Log client request
+    if let Some(logger) = &state.logger {
+        if let Ok(request_json) = serde_json::to_value(&request) {
+            logger.log_client_request(&endpoint, "gemini", &request_json);
+        }
+    }
+
     // Use routing to select backend based on capabilities
-    let selected_backend = {
-        let required_caps = routing::detect_capabilities_gemini(&request);
-        let required_caps_str: Vec<_> = required_caps.iter()
-            .map(|c| c.as_str())
-            .collect();
+    let required_caps = routing::detect_capabilities_gemini(&request);
+    let required_caps_str: Vec<_> = required_caps.iter()
+        .map(|c| c.as_str())
+        .collect();
 
-        info!("📋 Stream request requires capabilities: [{}]", required_caps_str.join(", "));
+    info!("📋 Stream request requires capabilities: [{}]", required_caps_str.join(", "));
 
-        match routing::select_backend_for_request(&required_caps, &state.config) {
-            Ok((backend_name, backend_config)) => {
-                let mode = if backend_config.capabilities.is_empty() {
-                    "AUTO (accepts all)"
-                } else {
-                    "EXPLICIT"
-                };
+    let selected_backend = match routing::select_backend_for_request(&required_caps, &state.config) {
+        Ok((backend_name, backend_config)) => {
+            let mode = if backend_config.capabilities.is_empty() {
+                "AUTO (accepts all)"
+            } else {
+                "EXPLICIT"
+            };
 
-                info!("✓ Routing selected: '{}' (mode: {}, url: {}, priority: {})",
-                    backend_name, mode, backend_config.url, backend_config.priority);
+            info!("✓ Routing selected: '{}' (mode: {}, url: {}, priority: {})",
+                backend_name, mode, backend_config.url, backend_config.priority);
 
-                metrics::record_routing_decision(&backend_name, &required_caps_str,
-                    if backend_config.capabilities.is_empty() { "auto" } else { "explicit" }, true);
+            metrics::record_routing_decision(&backend_name, &required_caps_str,
+                if backend_config.capabilities.is_empty() { "auto" } else { "explicit" }, true);
 
-                backend_name
-            },
-            Err(e) => {
-                warn!("⚠ Routing failed: {}", e);
-                info!("→ Falling back to command-line backend: {}", state.backend_type);
-                metrics::record_routing_decision("none", &required_caps_str, "failed", false);
-                state.backend_type.clone()
-            }
+            backend_name
+        },
+        Err(e) => {
+            warn!("⚠ Routing failed: {}", e);
+            info!("→ Falling back to command-line backend: {}", state.backend_type);
+            metrics::record_routing_decision("none", &required_caps_str, "failed", false);
+            state.backend_type.clone()
         }
     };
 
@@ -831,63 +841,160 @@ async fn stream_generate_content_impl(
     let backend_protocol_type = if let Some(backend_config) = state.config.backends.get(&selected_backend) {
         backend_config.protocol.as_str()
     } else {
-        // Fall back to command-line specified backend type if backend not in config
         state.backend_type.as_str()
     };
 
+    // Use IR architecture for streaming conversion
+    let frontend_converter = louter::ir::converters::gemini_frontend::GeminiFrontendConverter::new();
+
+    // Serialize and parse Gemini request to IR
+    let request_bytes = serde_json::to_vec(&request)
+        .map_err(|e| ProxyError::SerializationError(e))?;
+
+    let mut ir_request = frontend_converter.parse_request(&request_bytes).await?;
+    ir_request.model = model.clone();
+    ir_request.stream = true;
+
     match backend_protocol_type {
         "openai" => {
-            // OpenAI backend: Convert to OpenAI streaming format
-            let openai_api_key = state.config.get_api_key(&selected_backend, "OPENAI_API_KEY")
-                .ok_or_else(|| ProxyError::ConfigError("OpenAI API key not found in config or OPENAI_API_KEY environment variable".to_string()))?;
+            // OpenAI backend: Stream through IR converters
+            let backend_converter = louter::ir::converters::openai_backend::OpenAIBackendConverter;
 
-            let mut openai_request = conversion::gemini_to_openai_request(request, &model, &selected_backend, &state.config)?;
+            let openai_api_key = state.config.get_api_key(&selected_backend, "OPENAI_API_KEY")
+                .ok_or_else(|| ProxyError::ConfigError(format!("OpenAI API key not found for backend '{}' in config or OPENAI_API_KEY environment variable", selected_backend)))?;
+
+            // Format IR to OpenAI request
+            let openai_request_bytes = backend_converter.format_request(&ir_request).await?;
+            let mut openai_request: louter::models::openai::OpenAIRequest = serde_json::from_slice(&openai_request_bytes)
+                .map_err(|e| ProxyError::SerializationError(e))?;
+
+            // Apply model mapping
+            if let Some(backend_config) = state.config.backends.get(&selected_backend) {
+                if let Some(backend_model) = backend_config.model_mapping.get(&model) {
+                    openai_request.model = backend_model.clone();
+                    info!("Model mapping: '{}' → '{}'", model, backend_model);
+                }
+            }
+
+            // Enable streaming
             openai_request.stream = Some(true);
-            
-            let stream = state.backend_client.chat_completion_stream(&selected_backend, openai_request, &openai_api_key).await?;
-            let gemini_stream = conversion::openai_stream_to_gemini_sse(stream);
-            
+
+            // Log backend request
+            if let Some(logger) = &state.logger {
+                if let Ok(request_json) = serde_json::to_value(&openai_request) {
+                    logger.log_backend_request("/v1/chat/completions", "openai", &request_json);
+                }
+            }
+
+            // Get OpenAI SSE stream
+            let openai_stream = state.backend_client.chat_completion_stream(&selected_backend, openai_request, &openai_api_key).await?;
+
+            // Convert OpenAI SSE → IR chunks → Gemini SSE
+            let logger = state.logger.clone();
+            let gemini_stream = openai_stream.filter_map(move |result| {
+                let logger = logger.clone();
+                async move {
+                    // Create converters inside the async block (they're zero-sized types)
+                    let backend_converter = louter::ir::converters::openai_backend::OpenAIBackendConverter;
+                    let frontend_converter = louter::ir::converters::gemini_frontend::GeminiFrontendConverter::new();
+
+                    match result {
+                        Ok(openai_chunk) => {
+                            // Serialize OpenAI chunk to bytes
+                            if let Ok(chunk_bytes) = serde_json::to_vec(&openai_chunk) {
+                                // Parse OpenAI SSE chunk to IR
+                                if let Ok(ir_chunk) = backend_converter.parse_stream_chunk(&chunk_bytes) {
+                                    if let Some(chunk) = ir_chunk {
+                                        // Convert IR chunk to Gemini format
+                                        if let Ok(gemini_chunk_str) = frontend_converter.format_stream_chunk(&chunk) {
+                                            // Log the chunk
+                                            if let Some(ref logger) = logger {
+                                                if let Ok(chunk_json) = serde_json::from_str::<serde_json::Value>(&gemini_chunk_str) {
+                                                    logger.log_client_response("/v1beta/models/:streamGenerateContent", "gemini", &chunk_json);
+                                                }
+                                            }
+                                            return Some(Ok(axum::response::sse::Event::default().data(gemini_chunk_str)));
+                                        }
+                                    }
+                                }
+                            }
+                            None
+                        },
+                        Err(e) => Some(Err(axum::Error::new(e))),
+                    }
+                }
+            });
+
             Ok(axum::response::Sse::new(gemini_stream).into_response())
         },
         "gemini" => {
-            // Gemini backend: Pass-through streaming
-            let gemini_api_key = state.config.get_api_key("gemini", "GEMINI_API_KEY")
-                .ok_or_else(|| ProxyError::ConfigError("Gemini API key not found in config or GEMINI_API_KEY environment variable".to_string()))?;
+            // Gemini backend: Stream through IR converters (for consistency)
+            let backend_converter = louter::ir::converters::gemini_backend::GeminiBackendConverter;
 
-            // Log backend request (same as client request in pass-through mode)
+            let gemini_api_key = state.config.get_api_key(&selected_backend, "GEMINI_API_KEY")
+                .ok_or_else(|| ProxyError::ConfigError(format!("Gemini API key not found for backend '{}' in config or GEMINI_API_KEY environment variable", selected_backend)))?;
+
+            // Format IR to Gemini backend request
+            let backend_request_bytes = backend_converter.format_request(&ir_request).await?;
+            let backend_request: louter::models::gemini::GeminiRequest = serde_json::from_slice(&backend_request_bytes)
+                .map_err(|e| ProxyError::SerializationError(e))?;
+
+            // Log backend request
             if let Some(logger) = &state.logger {
-                if let Ok(request_json) = serde_json::to_value(&request) {
+                if let Ok(request_json) = serde_json::to_value(&backend_request) {
                     logger.log_backend_request(&format!("/v1beta/models/{}:streamGenerateContent", model), "gemini", &request_json);
                 }
             }
 
-            let stream = state.backend_client.gemini_stream_generate_content(request, &model, &gemini_api_key).await?;
+            // Get Gemini SSE stream
+            let gemini_backend_stream = state.backend_client.gemini_stream_generate_content(backend_request, &model, &gemini_api_key).await?;
 
-            // Convert the raw SSE stream to Axum SSE format
-            // Note: Streaming responses are logged as they arrive in the stream
-            use futures_util::StreamExt;
+            // Convert Gemini backend SSE → IR chunks → Gemini frontend SSE
             let logger = state.logger.clone();
             let model_clone = model.clone();
-            let sse_stream = stream.map(move |result| {
-                match result {
-                    Ok(line) => {
-                        // Log each stream chunk if logger is available
-                        if let Some(ref logger) = logger {
-                            if let Ok(chunk_json) = serde_json::from_str::<serde_json::Value>(&line) {
-                                logger.log_backend_response(&format!("/v1beta/models/{}:streamGenerateContent", model_clone), "gemini", &chunk_json);
-                                logger.log_client_response(&format!("/v1beta/models/{}:streamGenerateContent", model_clone), "gemini", &chunk_json);
+            let gemini_stream = gemini_backend_stream.filter_map(move |result| {
+                let logger = logger.clone();
+                let model_clone = model_clone.clone();
+                async move {
+                    // Create converters inside the async block (they're zero-sized types)
+                    let backend_converter = louter::ir::converters::gemini_backend::GeminiBackendConverter;
+                    let frontend_converter = louter::ir::converters::gemini_frontend::GeminiFrontendConverter::new();
+
+                    match result {
+                        Ok(line) => {
+                            // Log backend chunk
+                            if let Some(ref logger) = logger {
+                                if let Ok(chunk_json) = serde_json::from_str::<serde_json::Value>(&line) {
+                                    logger.log_backend_response(&format!("/v1beta/models/{}:streamGenerateContent", model_clone), "gemini", &chunk_json);
+                                }
                             }
-                        }
-                        Ok(axum::response::sse::Event::default().data(line))
-                    },
-                    Err(e) => Err(axum::Error::new(e)),
+
+                            // Parse Gemini backend SSE chunk to IR
+                            if let Ok(ir_chunk) = backend_converter.parse_stream_chunk(line.as_bytes()) {
+                                if let Some(chunk) = ir_chunk {
+                                    // Convert IR chunk back to Gemini frontend format
+                                    if let Ok(gemini_chunk_str) = frontend_converter.format_stream_chunk(&chunk) {
+                                        // Log client chunk
+                                        if let Some(ref logger) = logger {
+                                            if let Ok(chunk_json) = serde_json::from_str::<serde_json::Value>(&gemini_chunk_str) {
+                                                logger.log_client_response(&format!("/v1beta/models/{}:streamGenerateContent", model_clone), "gemini", &chunk_json);
+                                            }
+                                        }
+                                        return Some(Ok(axum::response::sse::Event::default().data(gemini_chunk_str)));
+                                    }
+                                }
+                            }
+                            None
+                        },
+                        Err(e) => Some(Err(axum::Error::new(e))),
+                    }
                 }
             });
 
-            Ok(axum::response::Sse::new(sse_stream).into_response())
+            Ok(axum::response::Sse::new(gemini_stream).into_response())
         },
         _ => {
-            Err(ProxyError::ConfigError(format!("Unsupported backend type: {}", state.backend_type)))
+            Err(ProxyError::ConfigError(format!("Unsupported backend type: {}", backend_protocol_type)))
         }
     }
 }
