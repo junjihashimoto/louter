@@ -8,6 +8,7 @@ pub mod routing;
 pub mod diagnostic;
 pub mod backends;
 pub mod conversion;
+pub mod ir;
 
 #[cfg(test)]
 mod tests;
