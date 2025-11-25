@@ -1139,6 +1139,8 @@ async fn handle_anthropic_messages(
     headers: HeaderMap,
     Json(request): Json<louter::models::anthropic::MessagesRequest>,
 ) -> Result<Response, ProxyError> {
+    use louter::ir::traits::{FrontendConverter, BackendConverter};
+
     let start_time = Instant::now();
     let original_model = request.model.clone();
 
@@ -1211,11 +1213,36 @@ async fn handle_anthropic_messages(
         }
     };
 
-    // Convert Anthropic request to OpenAI format
-    let openai_request = match conversion::anthropic_to_openai_request(request.clone(), &selected_backend, &state.config) {
-        Ok(req) => req,
+    // Convert Anthropic request to OpenAI format using IR converters
+    let frontend_converter = louter::ir::converters::anthropic_frontend::AnthropicFrontendConverter;
+    let backend_converter = louter::ir::converters::openai_backend::OpenAIBackendConverter;
+
+    // Serialize Anthropic request to bytes
+    let request_bytes = match serde_json::to_vec(&request) {
+        Ok(bytes) => bytes,
         Err(e) => {
-            // Log conversion error
+            let error = ProxyError::SerializationError(e);
+            if let Some(logger) = &state.logger {
+                if let Ok(request_json) = serde_json::to_value(&request) {
+                    logger.log_error(
+                        "/v1/messages",
+                        "anthropic",
+                        &error.to_string(),
+                        "serialization_error",
+                        Some(&request_json),
+                        Some(request_id.clone()),
+                        None,
+                    );
+                }
+            }
+            return Err(error);
+        }
+    };
+
+    // Parse Anthropic request to IR
+    let ir_request = match frontend_converter.parse_request(&request_bytes).await {
+        Ok(ir) => ir,
+        Err(e) => {
             if let Some(logger) = &state.logger {
                 if let Ok(request_json) = serde_json::to_value(&request) {
                     logger.log_error(
@@ -1230,6 +1257,49 @@ async fn handle_anthropic_messages(
                 }
             }
             return Err(e);
+        }
+    };
+
+    // Format IR to OpenAI request
+    let openai_request_bytes = match backend_converter.format_request(&ir_request).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            if let Some(logger) = &state.logger {
+                if let Ok(request_json) = serde_json::to_value(&request) {
+                    logger.log_error(
+                        "/v1/messages",
+                        "anthropic",
+                        &e.to_string(),
+                        error_type_from_error(&e),
+                        Some(&request_json),
+                        Some(request_id.clone()),
+                        None,
+                    );
+                }
+            }
+            return Err(e);
+        }
+    };
+
+    // Deserialize OpenAI request
+    let openai_request: louter::models::openai::OpenAIRequest = match serde_json::from_slice(&openai_request_bytes) {
+        Ok(req) => req,
+        Err(e) => {
+            let error = ProxyError::SerializationError(e);
+            if let Some(logger) = &state.logger {
+                if let Ok(request_json) = serde_json::to_value(&request) {
+                    logger.log_error(
+                        "/v1/messages",
+                        "anthropic",
+                        &error.to_string(),
+                        "serialization_error",
+                        Some(&request_json),
+                        Some(request_id.clone()),
+                        None,
+                    );
+                }
+            }
+            return Err(error);
         }
     };
 
@@ -1291,8 +1361,47 @@ async fn handle_anthropic_messages(
             }
         };
 
-        // Convert OpenAI stream to Anthropic SSE format
-        let anthropic_stream = conversion::openai_stream_to_anthropic_sse(stream, &original_model);
+        // Convert OpenAI stream to Anthropic SSE format using IR converters
+        use futures::StreamExt;
+
+        // Wrap frontend converter in Arc for stream usage
+        let frontend_converter_arc = std::sync::Arc::new(frontend_converter);
+        let backend_converter_arc = std::sync::Arc::new(backend_converter);
+        let original_model_clone = original_model.clone();
+
+        // Convert OpenAI stream responses to IR chunks, then to Anthropic SSE
+        let anthropic_stream = stream.map(move |response_result| {
+            match response_result {
+                Ok(openai_stream_response) => {
+                    // Serialize OpenAI stream response
+                    let response_bytes = match serde_json::to_vec(&openai_stream_response) {
+                        Ok(bytes) => bytes,
+                        Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                            format!("Failed to serialize OpenAI stream response: {}", e))),
+                    };
+
+                    // Parse to IR chunk
+                    let ir_chunk_opt = match backend_converter_arc.parse_stream_chunk(&response_bytes) {
+                        Ok(opt) => opt,
+                        Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                            format!("Failed to parse IR chunk: {}", e))),
+                    };
+
+                    // Convert IR chunk to Anthropic SSE if present
+                    if let Some(ir_chunk) = ir_chunk_opt {
+                        match frontend_converter_arc.format_stream_chunk(&ir_chunk) {
+                            Ok(sse_data) => Ok(axum::response::sse::Event::default().data(sse_data)),
+                            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
+                        }
+                    } else {
+                        // Skip if no IR chunk (e.g., empty delta)
+                        Ok(axum::response::sse::Event::default().comment("skipped"))
+                    }
+                },
+                Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
+            }
+        });
+
         Ok(axum::response::Sse::new(anthropic_stream).into_response())
     } else {
         // Non-streaming mode
@@ -1324,11 +1433,33 @@ async fn handle_anthropic_messages(
             }
         }
 
-        // Convert OpenAI response to Anthropic format
-        let anthropic_response = match conversion::openai_to_anthropic_response(openai_response.clone(), &original_model) {
-            Ok(resp) => resp,
+        // Convert OpenAI response to Anthropic format using IR converters
+        // Serialize OpenAI response
+        let openai_response_bytes = match serde_json::to_vec(&openai_response) {
+            Ok(bytes) => bytes,
             Err(e) => {
-                // Log conversion error
+                let error = ProxyError::SerializationError(e);
+                if let Some(logger) = &state.logger {
+                    if let Ok(request_json) = serde_json::to_value(&request) {
+                        logger.log_error(
+                            "/v1/messages",
+                            "anthropic",
+                            &error.to_string(),
+                            "serialization_error",
+                            Some(&request_json),
+                            Some(request_id.clone()),
+                            None,
+                        );
+                    }
+                }
+                return Err(error);
+            }
+        };
+
+        // Parse OpenAI response to IR
+        let ir_response = match backend_converter.parse_response(&openai_response_bytes).await {
+            Ok(ir) => ir,
+            Err(e) => {
                 if let Some(logger) = &state.logger {
                     if let Ok(request_json) = serde_json::to_value(&request) {
                         logger.log_error(
@@ -1343,6 +1474,49 @@ async fn handle_anthropic_messages(
                     }
                 }
                 return Err(e);
+            }
+        };
+
+        // Format IR to Anthropic response
+        let anthropic_response_bytes = match frontend_converter.format_response(&ir_response).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                if let Some(logger) = &state.logger {
+                    if let Ok(request_json) = serde_json::to_value(&request) {
+                        logger.log_error(
+                            "/v1/messages",
+                            "anthropic",
+                            &e.to_string(),
+                            error_type_from_error(&e),
+                            Some(&request_json),
+                            Some(request_id.clone()),
+                            None,
+                        );
+                    }
+                }
+                return Err(e);
+            }
+        };
+
+        // Deserialize Anthropic response
+        let anthropic_response: louter::models::anthropic::MessagesResponse = match serde_json::from_slice(&anthropic_response_bytes) {
+            Ok(resp) => resp,
+            Err(e) => {
+                let error = ProxyError::SerializationError(e);
+                if let Some(logger) = &state.logger {
+                    if let Ok(request_json) = serde_json::to_value(&request) {
+                        logger.log_error(
+                            "/v1/messages",
+                            "anthropic",
+                            &error.to_string(),
+                            "serialization_error",
+                            Some(&request_json),
+                            Some(request_id.clone()),
+                            None,
+                        );
+                    }
+                }
+                return Err(error);
             }
         };
 
