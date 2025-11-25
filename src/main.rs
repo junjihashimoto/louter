@@ -157,6 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // OpenAI API routes
         .route("/v1/chat/completions", post(handle_openai_chat_completions))
         // Anthropic (Claude) API routes
+        .route("/v1/models", get(list_anthropic_models))
         .route("/v1/messages", post(handle_anthropic_messages))
         // Catch-all route to log unmatched requests (for debugging)
         .fallback(catch_all_handler)
@@ -1384,6 +1385,65 @@ async fn handle_anthropic_messages(
 
         Ok(Json(anthropic_response).into_response())
     }
+}
+
+// List models for Anthropic API (GET /v1/models)
+async fn list_anthropic_models(State(state): State<AppState>) -> impl IntoResponse {
+    use serde_json::json;
+
+    // Collect all Claude models from backend configurations
+    let mut models = Vec::new();
+
+    for (backend_name, backend_config) in state.config.backends.iter() {
+        // Only include models that start with "claude-" from model_mapping keys
+        for model_name in backend_config.model_mapping.keys() {
+            if model_name.starts_with("claude-") {
+                models.push(json!({
+                    "type": "model",
+                    "id": model_name,
+                    "display_name": model_name,
+                    "created_at": "2024-01-01T00:00:00Z",
+                }));
+            }
+        }
+    }
+
+    // If no Claude models found, return default set
+    if models.is_empty() {
+        models = vec![
+            json!({
+                "type": "model",
+                "id": "claude-3-5-sonnet-20241022",
+                "display_name": "Claude 3.5 Sonnet",
+                "created_at": "2024-10-22T00:00:00Z",
+            }),
+            json!({
+                "type": "model",
+                "id": "claude-3-sonnet-20240229",
+                "display_name": "Claude 3 Sonnet",
+                "created_at": "2024-02-29T00:00:00Z",
+            }),
+            json!({
+                "type": "model",
+                "id": "claude-3-opus-20240229",
+                "display_name": "Claude 3 Opus",
+                "created_at": "2024-02-29T00:00:00Z",
+            }),
+            json!({
+                "type": "model",
+                "id": "claude-3-haiku-20240307",
+                "display_name": "Claude 3 Haiku",
+                "created_at": "2024-03-07T00:00:00Z",
+            }),
+        ];
+    }
+
+    Json(json!({
+        "data": models,
+        "has_more": false,
+        "first_id": models.first().and_then(|m| m.get("id")).map(|id| id.as_str()).flatten(),
+        "last_id": models.last().and_then(|m| m.get("id")).map(|id| id.as_str()).flatten(),
+    }))
 }
 
 // Catch-all handler to log unmatched requests
