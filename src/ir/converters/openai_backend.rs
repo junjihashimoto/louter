@@ -188,7 +188,6 @@ impl BackendConverter for OpenAIBackendConverter {
             if let Some(tool_call) = tool_calls.first() {
                 if let Some(name) = &tool_call.function.name {
                     // Start of tool call - emit content_block_start
-                    // (The wrapper in main.rs will track this separately from text blocks)
                     chunks.push(make_chunk(IRChunkType::ContentBlockStart {
                         index: tool_call.index.unwrap_or(0),
                         content_block: IRContentBlockStart::ToolUse {
@@ -196,7 +195,9 @@ impl BackendConverter for OpenAIBackendConverter {
                             name: name.clone(),
                         },
                     }));
-                } else if !tool_call.function.arguments.is_empty() {
+                }
+                // Note: Changed from 'else if' to 'if' to handle both name and arguments in same chunk
+                if !tool_call.function.arguments.is_empty() {
                     // Tool call arguments delta
                     chunks.push(make_chunk(IRChunkType::ContentBlockDelta {
                         index: tool_call.index.unwrap_or(0),

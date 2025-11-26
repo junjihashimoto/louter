@@ -310,10 +310,55 @@ fn convert_gemini_part_to_ir_content(part: &Part) -> Result<IRContent, ProxyErro
 }
 
 fn convert_gemini_function_to_ir_tool(func: FunctionDeclaration) -> IRTool {
+    // Try parameters_json_schema first, then fall back to parameters
+    let mut input_schema = func.parameters_json_schema
+        .or(func.parameters)
+        .unwrap_or(serde_json::json!({}));
+
+    // Convert Protobuf Schema (numeric type enums) to JSON Schema (string types)
+    convert_protobuf_schema_to_json_schema(&mut input_schema);
+
     IRTool {
         name: func.name,
         description: func.description,
-        input_schema: func.parameters_json_schema.unwrap_or(serde_json::json!({})),
+        input_schema,
+    }
+}
+
+/// Converts Protobuf Schema format to JSON Schema format
+/// Protobuf uses numeric type enums: 1=STRING, 2=NUMBER, 3=INTEGER, 4=BOOLEAN, 5=ARRAY, 6=OBJECT
+/// JSON Schema uses string types: "string", "number", "integer", "boolean", "array", "object"
+fn convert_protobuf_schema_to_json_schema(schema: &mut serde_json::Value) {
+    match schema {
+        serde_json::Value::Object(map) => {
+            // Convert "type" field from number to string
+            if let Some(type_val) = map.get("type") {
+                if let Some(type_num) = type_val.as_i64() {
+                    let type_str = match type_num {
+                        1 => "string",
+                        2 => "number",
+                        3 => "integer",
+                        4 => "boolean",
+                        5 => "array",
+                        6 => "object",
+                        _ => "string", // default
+                    };
+                    map.insert("type".to_string(), serde_json::Value::String(type_str.to_string()));
+                }
+            }
+
+            // Recursively process nested objects
+            for (_, value) in map.iter_mut() {
+                convert_protobuf_schema_to_json_schema(value);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            // Recursively process array elements
+            for item in arr.iter_mut() {
+                convert_protobuf_schema_to_json_schema(item);
+            }
+        }
+        _ => {}
     }
 }
 

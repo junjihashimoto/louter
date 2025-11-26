@@ -899,8 +899,20 @@ async fn stream_generate_content_impl(
 
             // Convert OpenAI SSE → IR chunks → Gemini SSE
             let logger = state.logger.clone();
+
+            // State for buffering function calls
+            // Gemini doesn't support streaming function calls, so we need to buffer them
+            #[derive(Clone)]
+            struct FunctionCallState {
+                name: String,
+                id: String,
+                args_buffer: String,
+            }
+            let function_call_state = std::sync::Arc::new(std::sync::Mutex::new(Option::<FunctionCallState>::None));
+
             let gemini_stream = openai_stream.flat_map(move |result| {
                 let logger = logger.clone();
+                let function_call_state = function_call_state.clone();
                 // Create converters inside the closure (they're zero-sized types)
                 let backend_converter = louter::ir::converters::openai_backend::OpenAIBackendConverter;
                 let frontend_converter = louter::ir::converters::gemini_frontend::GeminiFrontendConverter::new();
@@ -911,25 +923,139 @@ async fn stream_generate_content_impl(
                         if let Ok(chunk_bytes) = serde_json::to_vec(&openai_chunk) {
                             // Parse OpenAI SSE chunk to IR chunks (may return multiple)
                             if let Ok(ir_chunks) = backend_converter.parse_stream_chunk(&chunk_bytes) {
-                                // Convert each IR chunk to Gemini format
-                                ir_chunks.into_iter().filter_map(|chunk| {
-                                    if let Ok(gemini_chunk_str) = frontend_converter.format_stream_chunk(&chunk) {
-                                        // Skip chunks with empty candidates AND no usage metadata
-                                        // (but keep the final chunk with finishReason and usageMetadata)
-                                        if gemini_chunk_str.contains(r#""candidates":[]"#) && !gemini_chunk_str.contains(r#""usageMetadata""#) {
+                                // Process IR chunks with stateful function call buffering
+                                use louter::ir::types::{IRChunkType, IRContentBlockStart, IRDelta};
+                                use louter::models::gemini::{Part, GeminiStreamResponse, Content, Candidate};
+
+                                ir_chunks.into_iter().filter_map(|ir_chunk| {
+                                    // Handle function call buffering
+                                    match &ir_chunk.chunk_type {
+                                        IRChunkType::ContentBlockStart { content_block: IRContentBlockStart::ToolUse { id, name }, .. } => {
+                                            // Start buffering function call
+                                            let mut state = function_call_state.lock().unwrap();
+                                            *state = Some(FunctionCallState {
+                                                name: name.clone(),
+                                                id: id.clone(),
+                                                args_buffer: String::new(),
+                                            });
+                                            // Don't emit anything yet
+                                            return None;
+                                        },
+                                        IRChunkType::ContentBlockDelta { delta: IRDelta::InputJsonDelta { partial_json }, .. } => {
+                                            // Accumulate function arguments
+                                            let mut state = function_call_state.lock().unwrap();
+                                            if let Some(ref mut fc_state) = *state {
+                                                fc_state.args_buffer.push_str(partial_json);
+
+                                                // Check if JSON is complete (has matching braces)
+                                                let trimmed = fc_state.args_buffer.trim();
+                                                if !trimmed.is_empty() && trimmed.starts_with('{') && trimmed.ends_with('}') {
+                                                    // Try to parse to verify it's valid JSON
+                                                    if let Ok(_) = serde_json::from_str::<serde_json::Value>(&fc_state.args_buffer) {
+                                                        // JSON is complete! Emit the function call now
+                                                        let args: serde_json::Value = serde_json::from_str(&fc_state.args_buffer)
+                                                            .unwrap_or(serde_json::json!({}));
+
+                                                        let function_call = louter::models::gemini::FunctionCall {
+                                                            name: fc_state.name.clone(),
+                                                            args,
+                                                        };
+
+                                                        let gemini_response = GeminiStreamResponse {
+                                                            candidates: vec![Candidate {
+                                                                content: Content {
+                                                                    role: "model".to_string(),
+                                                                    parts: vec![Part::FunctionCall { function_call }],
+                                                                },
+                                                                finish_reason: None,
+                                                                index: Some(0),
+                                                                safety_ratings: None,
+                                                                citation_metadata: None,
+                                                            }],
+                                                            usage_metadata: None,
+                                                            model_version: Some(ir_chunk.model.clone()),
+                                                            response_id: Some(ir_chunk.message_id.clone()),
+                                                        };
+
+                                                        // Clear the buffer
+                                                        *state = None;
+                                                        drop(state);
+
+                                                        if let Ok(gemini_chunk_str) = serde_json::to_string(&gemini_response) {
+                                                            if let Some(ref logger) = logger {
+                                                                if let Ok(chunk_json) = serde_json::from_str::<serde_json::Value>(&gemini_chunk_str) {
+                                                                    logger.log_client_response("/v1beta/models/:streamGenerateContent", "gemini", &chunk_json);
+                                                                }
+                                                            }
+                                                            return Some(Ok(format!("{}\n", gemini_chunk_str)));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // Don't emit anything yet - still accumulating
+                                            return None;
+                                        },
+                                        IRChunkType::ContentBlockStop { .. } => {
+                                            // Emit complete function call
+                                            let mut state = function_call_state.lock().unwrap();
+                                            if let Some(fc_state) = state.take() {
+                                                // Parse the accumulated JSON args
+                                                let args: serde_json::Value = serde_json::from_str(&fc_state.args_buffer)
+                                                    .unwrap_or(serde_json::json!({}));
+
+                                                // Create Gemini functionCall part
+                                                let function_call = louter::models::gemini::FunctionCall {
+                                                    name: fc_state.name,
+                                                    args,
+                                                };
+
+                                                // Create complete response with functionCall
+                                                let gemini_response = GeminiStreamResponse {
+                                                    candidates: vec![Candidate {
+                                                        content: Content {
+                                                            role: "model".to_string(),
+                                                            parts: vec![Part::FunctionCall { function_call }],
+                                                        },
+                                                        finish_reason: None,
+                                                        index: Some(0),
+                                                        safety_ratings: None,
+                                                        citation_metadata: None,
+                                                    }],
+                                                    usage_metadata: None,
+                                                    model_version: Some(ir_chunk.model.clone()),
+                                                    response_id: Some(ir_chunk.message_id.clone()),
+                                                };
+
+                                                if let Ok(gemini_chunk_str) = serde_json::to_string(&gemini_response) {
+                                                    // Log the chunk
+                                                    if let Some(ref logger) = logger {
+                                                        if let Ok(chunk_json) = serde_json::from_str::<serde_json::Value>(&gemini_chunk_str) {
+                                                            logger.log_client_response("/v1beta/models/:streamGenerateContent", "gemini", &chunk_json);
+                                                        }
+                                                    }
+                                                    return Some(Ok(format!("{}\n", gemini_chunk_str)));
+                                                }
+                                            }
+                                            return None;
+                                        },
+                                        _ => {
+                                            // Regular chunk processing (text, metadata, etc.)
+                                            if let Ok(gemini_chunk_str) = frontend_converter.format_stream_chunk(&ir_chunk) {
+                                                // Skip chunks with empty candidates AND no usage metadata
+                                                if gemini_chunk_str.contains(r#""candidates":[]"#) && !gemini_chunk_str.contains(r#""usageMetadata""#) {
+                                                    return None;
+                                                }
+
+                                                // Log the chunk
+                                                if let Some(ref logger) = logger {
+                                                    if let Ok(chunk_json) = serde_json::from_str::<serde_json::Value>(&gemini_chunk_str) {
+                                                        logger.log_client_response("/v1beta/models/:streamGenerateContent", "gemini", &chunk_json);
+                                                    }
+                                                }
+                                                return Some(Ok(format!("{}\n", gemini_chunk_str)));
+                                            }
                                             return None;
                                         }
-
-                                        // Log the chunk
-                                        if let Some(ref logger) = logger {
-                                            if let Ok(chunk_json) = serde_json::from_str::<serde_json::Value>(&gemini_chunk_str) {
-                                                logger.log_client_response("/v1beta/models/:streamGenerateContent", "gemini", &chunk_json);
-                                            }
-                                        }
-                                        // Gemini uses NDJSON format (newline-delimited JSON), not SSE
-                                        Some(Ok(format!("{}\n", gemini_chunk_str)))
-                                    } else {
-                                        None
                                     }
                                 }).collect()
                             } else {
