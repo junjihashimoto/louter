@@ -32,9 +32,13 @@ class StreamChunkCapture:
         """Add a chunk to the capture."""
         self.chunks.append(chunk)
 
-        # Accumulate text
-        if chunk.text:
-            self.full_text += chunk.text
+        # Accumulate text (safely handle chunks without text)
+        try:
+            if chunk.text:
+                self.full_text += chunk.text
+        except (ValueError, AttributeError):
+            # Chunk doesn't have text (e.g., function call, empty final chunk)
+            pass
 
         # Collect tool calls
         if chunk.candidates and len(chunk.candidates) > 0:
@@ -225,8 +229,11 @@ def test_streaming_consistency():
         chunk_texts = []
         for chunk in response:
             capture.add_chunk(chunk)
-            if chunk.text:
-                chunk_texts.append(chunk.text)
+            try:
+                if chunk.text:
+                    chunk_texts.append(chunk.text)
+            except (ValueError, AttributeError):
+                pass
 
         # Verify chunks are not empty
         if len(chunk_texts) == 0:

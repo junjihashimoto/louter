@@ -1041,8 +1041,8 @@ async fn stream_generate_content_impl(
                                         _ => {
                                             // Regular chunk processing (text, metadata, etc.)
                                             if let Ok(gemini_chunk_str) = frontend_converter.format_stream_chunk(&ir_chunk) {
-                                                // Skip chunks with empty candidates AND no usage metadata
-                                                if gemini_chunk_str.contains(r#""candidates":[]"#) && !gemini_chunk_str.contains(r#""usageMetadata""#) {
+                                                // Skip all chunks with empty candidates (Python SDK crashes on these)
+                                                if gemini_chunk_str.contains(r#""candidates":[]"#) {
                                                     return None;
                                                 }
 
@@ -1165,9 +1165,8 @@ async fn stream_generate_content_impl(
                             ir_chunks.into_iter().filter_map(|chunk| {
                                 // Convert IR chunk back to Gemini frontend format
                                 if let Ok(gemini_chunk_str) = frontend_converter.format_stream_chunk(&chunk) {
-                                    // Skip chunks with empty candidates AND no usage metadata
-                                    // (but keep the final chunk with finishReason and usageMetadata)
-                                    if gemini_chunk_str.contains(r#""candidates":[]"#) && !gemini_chunk_str.contains(r#""usageMetadata""#) {
+                                    // Skip all chunks with empty candidates (Python SDK crashes on these)
+                                    if gemini_chunk_str.contains(r#""candidates":[]"#) {
                                         return None;
                                     }
 
