@@ -1,391 +1,524 @@
-# Louter - LLM Router
+# CLAUDE.md
 
-## Goal
-- Create an intelligent routing system for Large Language Models supporting multiple API formats
-- **Large-scale deployment support** with centralized API key management (not multi-tenant)
-- Allow Gemini API clients to access OpenAI models through familiar Gemini interface
-- Allow OpenAI API clients to access Gemini models through familiar OpenAI interface
-- Support all combinations: Gemini→OpenAI, Gemini→Gemini, OpenAI→OpenAI, OpenAI→Gemini
-- Content-based routing with automatic backend selection based on capabilities
-- Support multiple backends with fallback chains and load balancing
+> **Note for Claude:** This file is the **Single Source of Truth** for the `louter` project architecture, testing strategy, and coding standards. Read this before modifying any code.
 
-# Architecture
-- **Dual Frontend Support**: Accept both Gemini API and OpenAI API requests
-- **Dual Backend Support**: Route to either OpenAI or Gemini backends
-- **Bidirectional Conversion**: Automatic format conversion (camelCase ↔ snake_case)
-- **Centralized API Key Management**: Backend API keys from config/env (client headers ignored)
-- **Complete Logging**: JSON Lines logging for all request/response pairs
-- **Performance Metrics**: TTFT, TPS, ITL, e2e latency tracking (NVIDIA NIM-compliant)
-- **Web UI Dashboard**: Real-time log viewer and metrics visualization
+## 1. Project Overview
 
-# Technology Stack
-- Rust with Axum web framework
-- TOML config files for backend configuration
-- SSE (Server-Sent Events) for streaming
-- Prometheus for metrics export
-- Domain models for both Gemini and OpenAI APIs
+**Louter** is a multi-protocol coding agent proxy designed to unify communication between various frontend agents and LLM backends.
 
-# 🔄 Development Workflow
+*   **Supported Coding Agents (Frontends):**
+    *   Claude Code (via Anthropic API)
+    *   Gemini CLI (via Gemini API)
+    *   Codex / Cursor / Generic Tools (via OpenAI API)
+*   **Supported LLM Backends:**
+    *   OpenAI API, Gemini API
+    *   Self-hosted/OSS models: gpt-oss, Qwen (XML tools), Gemma3
+*   **Key Feature:** Protocol translation (Requests, SSE Streams, Tool Calling, Vision) via a strictly typed Internal Representation (IR).
 
-**Core Flow:** Implement → Test → Debug → Document
+---
 
-## Quick Checklist
+## 2. Architecture & Core IR
 
-When implementing any feature:
+We avoid "intermediate protocol models" that are too loose. Instead, we use a **Rust-native Core IR** heavily inspired by OpenAI's Chat Completions structure but owned by this project.
 
-- [ ] **1. Implement** - Write the code following CRITICAL CODING RULES below
-- [ ] **2. Build** - `cargo build --bin louter`
-- [ ] **3. Test** - Run diagnostics API to verify
-- [ ] **4. Debug** - If fails, follow standard debugging workflow
-- [ ] **5. Document** - Add to appropriate `docs/` directory
+### 2.1 Core Data Structures (The Contract)
 
-## Detailed Steps
+All Frontend and Backend adapters must convert TO/FROM these structures. Do not bypass them.
 
-### Step 1: Implement Feature
-
-**Files you'll typically modify:**
-- `src/config.rs` - If adding config options
-- `src/conversion.rs` - If changing protocol conversion
-- `src/main.rs` - If adding endpoints or routing logic
-- `src/models/` - If changing data structures
-- `src/diagnostic.rs` - If adding diagnostic tests (for `/api/diagnostics`)
-
-**Follow:** CRITICAL CODING RULES (below)
-
-### Step 2: Build & Start Proxy
-
-```bash
-# Build
-cargo build --bin louter
-
-# Start with logging
-cargo run --bin louter -- --host localhost --port 9000 \
-  --config config-public-api.toml \
-  --log-file /tmp/proxy.jsonl \
-  --verbose
-```
-
-### Step 3: Test with Diagnostics
-
-```bash
-# Run diagnostics (saves to file automatically)
-curl -s http://localhost:9000/api/diagnostics > /tmp/diagnostics.json
-
-# Check results
-cat /tmp/diagnostics.json | jq '.frontends[].test_results[] |
-  select(.passed == false) |
-  {test: .test_name, error: .error}'
-```
-
-**If all tests pass:** ✅ Done! Go to Step 5 (Document)
-**If any test fails:** ❌ Go to Step 4 (Debug)
-
-### Step 4: Debug Issues
-
-**ALWAYS follow this order:**
-
-1. **Save full diagnostics** - Already done in Step 3
-2. **Read error message** - `cat /tmp/diagnostics.json`
-3. **Check proxy logs** - `tail -50 /tmp/proxy.jsonl | jq .`
-4. **Follow standard workflow** - See [`docs/debug/standard-debugging-workflow.md`](docs/debug/standard-debugging-workflow.md)
-
-**Quick debug reference:**
-
-| Error Type | Debug Guide |
-|------------|-------------|
-| "Unsupported parameter" | [`docs/debug/error-map-and-solutions.md#error-21`](docs/debug/error-map-and-solutions.md) |
-| "Missing field" | [`docs/debug/error-map-and-solutions.md#error-23`](docs/debug/error-map-and-solutions.md) |
-| "Backend not configured" | [`docs/debug/error-map-and-solutions.md#error-11`](docs/debug/error-map-and-solutions.md) |
-| MAX_TOKENS errors | [`docs/debug/error-map-and-solutions.md#error-24`](docs/debug/error-map-and-solutions.md) |
-| Any other error | [`docs/debug/standard-debugging-workflow.md`](docs/debug/standard-debugging-workflow.md) |
-
-### Step 5: Document Changes
-
-**If you fixed a bug:**
-```bash
-# Create resolved issue document
-cat > docs/resolved/$(date +%Y-%m-%d)-issue-name-RESOLVED.md
-```
-
-**If you added a feature:**
-- Update `CLAUDE.md` (this file) if it's a critical rule
-- Add tutorial to `docs/tutorial/` if users need to know
-- Add design doc to `docs/design/` if architecture changed
-
-**See:** [`docs/README.md`](docs/README.md) for documentation organization
-
-## When Things Go Wrong
-
-**"I'm stuck debugging"**
-→ Read [`docs/debug/standard-debugging-workflow.md`](docs/debug/standard-debugging-workflow.md)
-
-**"I don't know what's causing the error"**
-→ Check [`docs/debug/error-map-and-solutions.md`](docs/debug/error-map-and-solutions.md)
-
-**"Test passes locally but fails in diagnostics"**
-→ Compare logs: `grep "test_name" /tmp/proxy.jsonl | jq .`
-
-**"Backend works directly but fails through proxy"**
-→ Check protocol conversion in logs
-
-## ⚠️ CRITICAL CODING RULES
-
-### 1. NEVER Hardcode Model Names
-**RULE:** All model names MUST come from `config.toml` file's `model_mapping` section.
-
-**❌ WRONG:**
 ```rust
-let model = "gpt-3.5-turbo";  // NEVER hardcode!
-let model = "gemini-pro";      // NEVER hardcode!
+// Core Request (Input)
+pub struct CoreChatRequest {
+    pub model: String, // Abstract model name (resolved via config)
+    pub messages: Vec<CoreMessage>,
+    pub tools: Vec<CoreTool>,
+    pub tool_choice: CoreToolChoice,
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+    pub top_p: Option<f32>,
+    pub stream: bool,
+    pub response_format: Option<CoreResponseFormat>, // json_object, text
+    pub vision: Option<CoreVisionOptions>,
+    // Escape hatch for protocol-specific metadata (e.g., Anthropic beta headers)
+    pub metadata: serde_json::Value,
+}
+
+pub struct CoreMessage {
+    pub role: CoreRole, // System, User, Assistant, Tool
+    pub content: Vec<CoreContentPart>,
+}
+
+pub enum CoreContentPart {
+    Text(String),
+    Image {
+        media_type: String,
+        data: String, // base64
+    },
+    ToolResult {
+        tool_call_id: String,
+        content: String,
+    },
+    // ... potentially others
+}
+
+// Core Streaming Events (Output)
+// Must handle both text and tool calls uniformly across protocols.
+pub enum CoreStreamEvent {
+    TextDelta {
+        index: u32,
+        content: String,
+    },
+    ToolCallDelta {
+        index: u32,
+        delta: CoreToolCallDelta,
+    },
+    Usage(CoreUsage),
+    FinalResponse(CoreChatResponse), // For non-streaming fallback
+    Error(CoreError),
+}
+
+pub enum CoreToolCallDelta {
+    Start { id: String, name: String },
+    ArgumentsText { id: String, fragment: String }, // Raw accumulation
+    ArgumentsJson { id: String, arguments: serde_json::Value }, // Parsed (if available)
+    Done { id: String },
+}
 ```
 
-**✅ CORRECT:**
+### 2.2 Adapter Traits
+
+Frontends and Backends are decoupled.
+
 ```rust
-// Get model from backend's model_mapping
-let model = backend_config.model_mapping.values().next()
-    .cloned()
-    .ok_or("No model_mapping configured")?;
+#[async_trait::async_trait]
+pub trait FrontendAdapter: Send + Sync {
+    fn protocol_name(&self) -> &'static str;
+    
+    /// Parse incoming HTTP request to Core IR
+    async fn parse_request(&self, req: &HttpRequest) -> Result<CoreChatRequest, CoreError>;
+    
+    /// Encode Core IR event to protocol-specific SSE event or JSON
+    fn encode_stream_event(&self, event: CoreStreamEvent) -> Option<FrontendEncodedChunk>;
+}
+
+#[async_trait::async_trait]
+pub trait BackendAdapter: Send + Sync {
+    fn backend_name(&self) -> &'static str;
+    
+    /// Build backend-specific HTTP request from Core IR
+    fn build_http_request(&self, core: &CoreChatRequest, target_model: &str) -> Result<BackendHttpRequest, CoreError>;
+    
+    /// Decode backend SSE chunk to Core IR events (Stateful)
+    fn decode_stream_chunk(&mut self, chunk: BackendSseChunk) -> Result<Vec<CoreStreamEvent>, CoreError>;
+}
 ```
 
-**Why:** Different deployments use different models. Hardcoding breaks flexibility.
+---
 
-### 2. Vision Tests Use Base64 Format
-**RULE:** Vision capability tests MUST use base64-encoded images, not external URLs.
+## 3. Implementation Details
 
-**Note:** The enum name `ImageUrl` is misleading - it accepts base64 data URLs.
+### 3.1 Function Calling & XML Support (Qwen)
 
-### 3. Frontend Diagnostics MUST Test Cross-Protocol Scenarios
-**RULE:** Frontend diagnostics must test ALL 4 protocol combinations to verify bidirectional conversion.
+Some backends (e.g., Qwen) use XML for function calling. The Backend Adapter must handle the conversion to OpenAI-style JSON `tools`.
 
-**Required Test Matrix:**
-```
-Frontend API    Backend Protocol    Test Name
------------    ----------------    ---------
-Gemini API  →  Gemini backend     (native)
-Gemini API  →  OpenAI backend     (conversion)
-OpenAI API  →  OpenAI backend     (native)
-OpenAI API  →  Gemini backend     (conversion)
-```
+*   **Requirement:** The Proxy must be stateful (buffer tokens) to parse XML cleanly during streaming.
+*   **Qwen State Machine Logic:**
 
-**Why:** Cross-protocol conversion is a core feature. Must verify Gemini↔OpenAI conversion works in both directions.
-
-### 4. Token Count Mapping (Gemini ↔ OpenAI)
-**RULE:** Gemini separates output tokens into visible and thinking tokens. OpenAI combines them.
-
-**Gemini → OpenAI:**
 ```rust
-completion_tokens = candidates_token_count + thoughts_token_count
+enum QwenMode {
+    NormalText,
+    InToolCall, // Buffering <tool_call>...</tool_call>
+}
+
+struct QwenXmlState {
+    mode: QwenMode,
+    xml_buffer: String,
+}
+
+// Logic:
+// 1. Detect "<tool_call>" -> Switch to InToolCall.
+// 2. Buffer content. Do NOT emit text to frontend.
+// 3. Detect "</tool_call>" -> Parse XML -> Emit CoreToolCallDelta (Start -> Args -> Done).
+// 4. Reset to NormalText.
 ```
 
-**OpenAI → Gemini:**
-```rust
-candidates_token_count = completion_tokens
-thoughts_token_count = None  // OpenAI doesn't separate them
+### 3.2 Parallel Tool Execution
+
+*   **Protocol Support:** OpenAI, Anthropic, and Gemini all support defining multiple tools in a single response turn.
+*   **Constraint:** `CoreChatRequest` / `CoreStreamEvent` must always support `Vec<ToolCall>`.
+*   **Execution:** The proxy does not execute tools; it forwards the request. The *Coding Agent* (client) is responsible for executing tools (potentially in parallel) and returning results.
+
+---
+
+## 4. Testing Strategy
+
+Since testing with real agents (UI) is flaky and expensive, we use a 3-layer approach.
+
+### 4.1 Layer 1: Protocol Contract (SDK-based)
+
+Use official SDKs (Anthropic Python SDK, OpenAI Node SDK, etc.) to simulate agents.
+
+*   **Goal:** Validate protocol compliance.
+*   **Method:** Send standard requests (Text, Tools, Vision) via SDK -> Proxy -> Mock/Real Backend.
+*   **Success:** SDK receives correct response without error.
+
+### 4.2 Layer 2: Record & Replay (Baseline vs. Proxy)
+
+To isolate bugs, we use a "Recording" mechanism with two modes:
+
+1.  **Baseline Mode (Pass-through):**
+    *   Client -> Louter (Pass-through) -> Real API.
+    *   Record: Raw Request/Response & Normalized Core IR.
+2.  **Proxy Mode (Transformation):**
+    *   Client -> Louter (Transform) -> Real Backend.
+    *   Record: Raw Request/Response & Normalized Core IR.
+
+**Analysis:**
+Compare the `CoreChatRequest` and `final_core_response` traces.
+*   If Baseline works but Proxy fails -> **Proxy Bug**.
+*   If both fail -> **Agent/Backend Issue**.
+
+**Trace JSON Format:**
+```json
+{
+  "trace_id": "uuid",
+  "frontend": {
+    "protocol": "anthropic",
+    "core_request": { ... } // Normalized
+  },
+  "backend": {
+    "provider": "qwen",
+    "core_events": [ ... ],
+    "final_response": { ... }
+  },
+  "status": "ok"
+}
 ```
 
-See `src/models/gemini.rs:156-185` for detailed documentation.
+### 4.3 Layer 3: E2E Smoke Tests
+Only occasionally run real Claude Code / Gemini CLI to verify end-to-end integration.
 
-# Implementation Status
+---
 
-## Core Features - ✅ Completed
-- ✅ Domain models (Gemini & OpenAI APIs with proper camelCase/snake_case)
-- ✅ Bidirectional conversion logic (Gemini ↔ OpenAI)
-- ✅ Streaming SSE support for both formats
-- ✅ Configuration management (TOML)
-- ✅ Multi-backend support with flexible configuration
-- ✅ Function calling conversion (functionCall ↔ tool_calls)
-- ✅ XML tool format support (Qwen3-Coder compatibility)
-- ✅ Multimedia support (images, audio, video, PDF)
-- ✅ Content-based routing with automatic capability detection
-- ✅ Performance metrics (TTFT, TPS, ITL, e2e)
-- ✅ Prometheus metrics export
-- ✅ Web UI Dashboard with real-time visualization
-- ✅ JSON Lines logging for all request/response pairs
-- ✅ Automated diagnostic testing
+## 5. Development Guidelines
 
-## Recent Fixes (2025-11-21)
+1.  **Strict Typing:** Do not use `serde_json::Value` loosely. Use the `CoreChatRequest` structs.
+2.  **Config Driven:** Never hardcode model names (e.g., "claude-3-5-sonnet"). Use `config.toml` mappings.
+3.  **Error Handling:**
+    *   UI errors in agents are hard to debug.
+    *   Always emit detailed logs with `trace_id`.
+    *   Use the Diagnostics Endpoint: `curl http://localhost:8080/api/diagnostics`.
+4.  **Testing:**
+    *   Before pushing, run the SDK simulation suite.
+    *   If adding a new protocol, add a corresponding fixture in `tests/fixtures`.
 
-### ✅ Issue 1: Configurable Temperature Per-Backend
-**Problem:** Some backends (e.g., OpenAI gpt-5-nano) don't support custom temperature values.
+## 6. Haskell Implementation Architecture
 
-**Solution:** Added `temperature_override` config option.
-```toml
-[backends.openai]
-temperature_override = true  # Override client's temperature with backend's value
-# temperature not set = use default
+### Overview
+
+**Key Design Principle:** *"Louter is a protocol converter. The API can connect to OpenAI API and Gemini API like the proxy."*
+
+**Single Unified Implementation: `louter`**
+
+The Haskell `louter` package serves dual purposes:
+
+1. **As a Library** - Import into your Haskell application to connect to any LLM API
+   ```haskell
+   import Louter.Client
+
+   -- Connect to Gemini API using OpenAI-style requests
+   client <- newClient GeminiBackend "gemini-api-key"
+   response <- chatCompletion client openAIStyleRequest
+   ```
+
+2. **As a Proxy Server** - Run standalone to proxy requests between protocols
+   ```bash
+   stack run louter-server -- --config config.toml --port 9000
+   ```
+
+**Core Components:**
+- Protocol converters (OpenAI ↔ Gemini ↔ Anthropic)
+- SSE parser with attoparsec
+- Delta tokenizer/classifier
+- Stateful function call buffering
+- Mock server for testing (`openai-mock`)
+
+### 6.1 SSE Parsing with Attoparsec
+
+The library uses `attoparsec` for efficient incremental SSE parsing.
+
+**SSE Format:**
+```
+data: {"id":"chatcmpl-...","choices":[{"delta":{...}}]}\n
+\n
 ```
 
-**Files:** `src/config.rs`, `src/conversion.rs:286-296`, `config-public-api.toml`
+**Parser Structure:**
+```haskell
+data SSEChunk = SSEChunk
+  { sseData :: ByteString  -- Raw JSON payload
+  , sseEvent :: Maybe Text -- Optional event type
+  } | SSEDone              -- [DONE] marker
 
-### ✅ Issue 2: MAX_TOKENS Errors with Thinking Tokens
-**Problem:** Gemini 2.5+ uses thinking tokens, causing MAX_TOKENS errors with low limits.
-
-**Solution:** Increased diagnostic test token limits.
-- Vision tests: 400 → 1000 tokens
-- Text/function tests: 200 → 500 tokens
-
-**Files:** `src/diagnostic.rs:886,896`
-
-### ✅ Issue 3: Optional Fields in Gemini Responses
-**Problem:** Gemini responses missing `candidatesTokenCount` or `parts` when blocked or MAX_TOKENS.
-
-**Solution:** Made fields optional with proper defaults.
-- `candidates_token_count: Option<i32>` (missing when blocked)
-- `parts: Vec<Part>` with `#[serde(default)]` (empty when MAX_TOKENS)
-- `thoughts_token_count: Option<i32>` (Gemini 2.5+ thinking tokens)
-
-**Files:** `src/models/gemini.rs:156-185`, `src/conversion.rs:400-409,970-985`
-
-### ✅ Issue 4: max_tokens vs max_completion_tokens
-**Problem:** OpenAI models have different token field requirements (older: `max_tokens`, newer: `max_completion_tokens`).
-
-**Solution:** Added `max_tokens_field` config option.
-```toml
-[backends.openai]
-max_tokens_field = "max_completion_tokens"  # For newer OpenAI models
-
-[backends.gpt-oss]
-max_tokens_field = "max_tokens"  # For llama.cpp server
+parseSSE :: Parser SSEChunk
+parseSSE = choice
+  [ string "data: [DONE]" >> pure SSEDone
+  , SSEChunk <$> (string "data: " *> takeTill isEndOfLine) <*> pure Nothing
+  ]
 ```
 
-**Files:** `src/config.rs`, `src/conversion.rs:278-284`, `config-public-api.toml`
+### 6.2 Delta Type Classification
 
-## Per-Backend Configuration Options
+The tokenizer identifies delta types by examining the JSON structure:
 
-### Backend-Specific Settings
-```toml
-[backends.<name>]
-url = "https://api.example.com"
-protocol = "openai"  # or "gemini"
-temperature_override = false  # Override client's temperature
-max_tokens_field = "both"  # "max_tokens", "max_completion_tokens", or "both"
-tool_format = "json"  # or "xml" (for Qwen3-Coder)
-custom_instruction = "..."  # Per-backend system instruction
-custom_instruction_mode = "append"  # "override", "prepend", or "append"
+```haskell
+data DeltaType
+  = ReasoningDelta Text       -- delta.reasoning: "thinking tokens"
+  | ContentDelta Text         -- delta.content: "response text"
+  | ToolCallDelta ToolCallFragment  -- delta.tool_calls[]: function call
+  | RoleDelta Role            -- delta.role: "assistant"
+  | FinishDelta FinishReason  -- finish_reason: "stop" | "tool_calls"
+  | EmptyDelta                -- delta: {}
 
-# Routing configuration
-capabilities = ["text", "vision", "function_calling"]
-priority = 1  # Lower number = higher priority
-fallback = "other-backend"  # Fallback backend name
+data ToolCallFragment = ToolCallFragment
+  { tcfIndex :: Int
+  , tcfId :: Maybe Text
+  , tcfName :: Maybe Text
+  , tcfArguments :: Maybe Text
+  }
 
-[backends.<name>.model_mapping]
-"frontend-model-name" = "backend-model-name"
+classifyDelta :: Value -> Either String DeltaType
+classifyDelta = withObject "delta" $ \obj -> do
+  case HM.lookup "delta" obj of
+    Just (Object delta) ->
+      case HM.lookup "reasoning" delta of
+        Just (String txt) -> pure $ ReasoningDelta txt
+        Nothing -> case HM.lookup "content" delta of
+          Just (String txt) -> pure $ ContentDelta txt
+          Nothing -> case HM.lookup "tool_calls" delta of
+            Just (Array calls) -> ... -- Parse tool call fragment
+            Nothing -> pure EmptyDelta
 ```
 
-## API Key Management (Design Decision)
+### 6.3 Buffering Strategy
 
-**Centralized API Key Management:** The proxy uses API keys from environment variables or config file for all backend requests. This is the intended design for **large-scale deployments**.
+**Key Principle:** Different delta types require different streaming behaviors.
 
-**Design Goals:**
-- **Large-scale production** - Handle high request volumes with centralized API key management
-- **Single point of control** - Backend API keys managed by proxy operator, not clients
-- **Cost control** - Centralized billing and usage tracking under one API key
-- **Security** - Backend API keys never exposed to clients
+| Delta Type | Buffering | Reason |
+|------------|-----------|--------|
+| `reasoning` | **No buffer** - stream immediately | User sees thinking process in real-time |
+| `content` | **No buffer** - stream immediately | User sees response text as it generates |
+| `tool_calls` | **Buffer until complete** | Must assemble valid JSON before emitting |
+| `role` | **Pass through** | Metadata, no buffering needed |
+| `finish_reason` | **Pass through** | End-of-stream marker |
 
-**Client Authorization headers are ignored** - this is intentional, not a bug.
+**State Machine:**
+```haskell
+data StreamState = StreamState
+  { ssToolCalls :: Map Int ToolCallState  -- Track by index
+  , ssMessageId :: Text
+  }
 
-**Not designed for:**
-- Multi-tenant deployments (different users with different API keys)
-- Client-provided API key passthrough
+data ToolCallState = ToolCallState
+  { tcsId :: Text
+  , tcsName :: Text
+  , tcsArguments :: Builder  -- Efficient text accumulation
+  , tcsComplete :: Bool
+  }
 
-## Future Enhancements
+processChunk :: StreamState -> DeltaType -> (StreamState, [OutputChunk])
+processChunk state (ContentDelta txt) =
+  -- Immediate emission, no buffering
+  (state, [OutputContentChunk txt])
 
-**High Priority** (Production Essentials):
-- 📋 **Response Caching** - Reduce costs by 40-80% with Redis/in-memory cache
-- 📋 **Rate Limiting** - Per-IP and global limits for abuse prevention and cost control
-- 🔄 **Load Balancing & Failover** - Distribute traffic with health checks and circuit breakers
-- 📋 **Cost Tracking & Budgets** - Track token usage × pricing with budget enforcement
+processChunk state (ToolCallDelta frag) =
+  -- Buffer arguments, emit only when JSON is complete
+  let newState = updateToolCallBuffer state frag
+      maybeComplete = checkJSONComplete newState (tcfIndex frag)
+  in case maybeComplete of
+       Just toolCall -> (resetBuffer newState, [OutputToolCall toolCall])
+       Nothing -> (newState, [])  -- Keep buffering
+```
 
-**Medium Priority** (Production Readiness):
-- 📋 **Usage Tracking** - Per-endpoint and per-model usage analytics
-- 📋 **Distributed Tracing** - OpenTelemetry integration for debugging
-- 📋 **TLS/HTTPS Support** - Secure communication with automatic cert renewal
+### 6.4 JSON Completeness Detection
 
-**Low Priority** (Enhancements):
-- 📋 **Hot Config Reload** - Update configuration without restart
-- 📋 **Additional API Formats** - Support for Claude, Cohere, Azure OpenAI
-- 📋 **WebSocket Support** - Alternative to SSE for streaming
+```haskell
+isCompleteJSON :: Text -> Bool
+isCompleteJSON txt =
+  let trimmed = T.strip txt
+  in not (T.null trimmed)
+     && T.head trimmed == '{'
+     && T.last trimmed == '}'
+     && isRight (eitherDecode (encodeUtf8 txt) :: Either String Value)
+```
 
-Legend: ✅ Completed | 🔄 Partially Designed | 📋 Planned
+### 6.5 Client Library API
 
-# Quick Start
+**Simple Usage:**
+```haskell
+import Louter.Client
+import Louter.Client.OpenAI (llamaServerClient)
+import Louter.Client.Gemini (geminiClient)
 
-## Starting the Proxy Server
+main :: IO ()
+main = do
+  -- For cloud APIs (requires authentication)
+  client <- geminiClient "your-api-key"
+
+  -- For local llama-server (no authentication)
+  llamaClient <- llamaServerClient "http://localhost:11211"
+
+  -- Non-streaming request
+  response <- chatCompletion client $ defaultChatRequest "gpt-4"
+    [Message RoleUser "Hello!"]
+  print response
+
+  -- Streaming request with callback
+  streamChatWithCallback client request $ \event -> case event of
+    StreamContent txt -> putStr txt >> hFlush stdout
+    StreamReasoning txt -> putStrLn ("[thinking] " <> txt)
+    StreamToolCall call -> print call  -- Already complete!
+    StreamFinish reason -> putStrLn ("\n[Done: " <> reason <> "]")
+    StreamError err -> putStrLn ("[Error: " <> err <> "]")
+```
+
+**Backend Configuration:**
+```haskell
+-- Backend type includes authentication flag
+data Backend
+  = BackendOpenAI
+      { backendApiKey :: Text
+      , backendBaseUrl :: Maybe Text
+      , backendRequiresAuth :: Bool  -- True for OpenAI, False for llama-server
+      }
+  | BackendGemini { ... , backendRequiresAuth :: Bool }
+  | BackendAnthropic { ... , backendRequiresAuth :: Bool }
+
+-- Helper functions handle authentication automatically
+llamaServerClient :: Text -> IO Client  -- No auth
+geminiClient :: Text -> IO Client       -- Requires auth
+```
+
+**Key Features:**
+- Tool calls are **automatically buffered** - callback receives complete JSON
+- Conduit integration for composable streaming
+- **Configurable authentication** - supports both authenticated and non-authenticated endpoints
+- Mock server support for testing
+
+### 6.6 Proxy Server Architecture
+
+**Protocol Conversion (OpenAI as Base):**
+```
+Anthropic Request  ─┐
+                    ├─→ OpenAI IR ─→ Backend (via client library)
+Gemini Request     ─┘
+
+Backend Response ─→ OpenAI IR ─┬─→ Anthropic Response
+                               ├─→ Gemini Response
+                               └─→ OpenAI Response
+```
+
+**Converter Interface:**
+```haskell
+class ProtocolConverter a where
+  toOpenAI :: a -> OpenAIRequest
+  fromOpenAI :: OpenAIChunk -> a
+
+instance ProtocolConverter AnthropicRequest where
+  toOpenAI (AnthropicRequest msgs tools) =
+    OpenAIRequest
+      { messages = map convertMessage msgs
+      , tools = map convertTool tools
+      }
+
+instance ProtocolConverter GeminiChunk where
+  fromOpenAI (OpenAIChunk choices) =
+    GeminiResponse
+      { candidates = map convertChoice choices
+      , usageMetadata = extractUsage choices
+      }
+```
+
+**Proxy Server Usage:**
+```haskell
+-- Client connects to proxy
+-- curl http://localhost:9000/v1/messages (Anthropic format)
+
+-- Proxy uses client library to call backend
+backend <- newClient backendConfig
+response <- streamChat backend openAIRequest handleChunk
+
+-- Proxy converts response to Anthropic format
+anthropicChunks = map (fromOpenAI @AnthropicChunk) response
+```
+
+### 6.7 Mock Server for Testing
+
+**Purpose:** Replay captured test-data responses for deterministic testing.
+
+```haskell
+-- Load test data from test-data/openai/streaming_function_calling/
+loadTestResponse :: FilePath -> IO [SSEChunk]
+
+-- Mock server endpoint
+mockStreamingEndpoint :: Request -> IO Response
+mockStreamingEndpoint req = do
+  chunks <- loadTestResponse "test-data/openai/streaming_function_calling/sample_response.txt"
+  return $ responseStream status200 headers (streamChunks chunks)
+```
+
+**Test Data Coverage:**
+- ✅ `streaming_function_calling/` - Function calls with incremental JSON
+- ✅ `function_calling/` - Non-streaming function calls
+- ✅ `streaming/` - Text-only streaming
+- ✅ `text/` - Simple text responses
+- ⚠️  **Missing:** Vision, audio, errors, multiple parallel tools
+
+### 6.8 Data Collection Process
+
+When test data is insufficient, collect it using:
 
 ```bash
-# Start with config file
-cargo run --bin louter -- --host localhost --port 8080 --config config.toml --log-file proxy.jsonl --verbose
+# Collect streaming function calling data
+./test-data/openai/streaming_function_calling/test.sh > new_sample.txt
 
-# Health check
-curl http://localhost:8080/health
-
-# View Web UI Dashboard
-open http://localhost:8080/ui
-
-# View Prometheus metrics
-curl http://localhost:8080/metrics
-```
-
-## Example Usage
-
-### Gemini API Frontend
-```bash
-# Generate content
-curl -X POST 'http://localhost:8080/v1beta/models/gemini-2.0-flash:generateContent' \
+# Collect vision data (when implemented)
+curl -N http://127.0.0.1:11211/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{
-    "contents": [{
-      "parts": [{"text": "Hello, world!"}],
-      "role": "user"
-    }]
-  }'
+  -d @vision_request.json > test-data/openai/vision/sample_response.txt
 ```
 
-### OpenAI API Frontend
-```bash
-# Chat completions
-curl -X POST 'http://localhost:8080/v1/chat/completions' \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gemma3-4b",
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "max_tokens": 100
-  }'
-```
+**Required Test Scenarios:**
+1. **Vision streaming** - Image analysis with content deltas
+2. **Audio streaming** - Audio content parts
+3. **Multiple parallel tools** - Multiple `tool_calls[i]` in single response
+4. **Error handling** - Rate limits, model errors, invalid requests
+5. **Stop sequences** - Responses with `finish_reason: "stop"`
+6. **Max tokens** - Responses with `finish_reason: "length"`
 
-## Development Tools
+## 7. Commands
 
 ```bash
-# Run diagnostic tests
-curl -s http://localhost:9000/api/diagnostics > diagnostics.json
+# === Rust Implementation ===
+# Run Rust Proxy Server
+cargo run --bin louter -- --config config-dev.toml
 
-# Parse logs (recommended - provides structured queries)
-cargo run --bin log-parser -- --file proxy.jsonl stats
-cargo run --bin log-parser -- --file proxy.jsonl functions
-cargo run --bin log-parser -- --file proxy.jsonl pairs
+# Run Diagnostics (Built-in self-test)
+curl -s http://localhost:8080/api/diagnostics | jq .
 
-# Or use jq directly (requires knowledge of log schema)
-# See docs/design/log-format.md for schema documentation
-tail -20 proxy.jsonl | jq .
-cat proxy.jsonl | jq 'select(.direction == "client_request")'
-```
+# Run Protocol Integration Tests
+TEST_INTEGRATION=1 cargo test --test integration_protocol
 
-# Documentation Organization
+# === Haskell Implementation ===
+# Build both library and proxy
+stack build
 
-Project documentation is organized under `docs/` directory:
+# Run Haskell Mock Server (for testing without API)
+stack run openai-mock -- --test-data ./test-data --port 11211
 
-- **`docs/tutorial/`** - Getting started guides and tutorials
-- **`docs/design/`** - Architecture and design decisions
-- **`docs/issues/`** - Known issues and limitations
-- **`docs/plans/`** - Future feature plans and roadmaps
-- **`docs/resolved/`** - Resolved issues and fixes
-- **`docs/debug/`** - Debugging techniques and troubleshooting
+# Run Haskell Proxy Server
+stack run louter-hs -- --config config-dev.toml --port 9000
 
-Historical development documents (test results, debug sessions) should be moved to appropriate subdirectories before release.
-
-# Additional Resources
-
-- **README.md** - Project overview and installation instructions
-- **config-public-api.toml** - Example configuration for public APIs
-- **config-mock.toml** - Example configuration for local testing
-- **test-*.sh** - Test scripts for various scenarios
+# Use Haskell Client Library (in your app)
+import OpenAI.Client
+client <- newClient "sk-..."
+response <- streamChat client request handleChunk

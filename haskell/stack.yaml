@@ -1,0 +1,11 @@
+resolver: lts-22.28
+
+packages:
+  - louter       # Main library with protocol converters and client API
+  - openai-mock  # Mock server for testing
+
+extra-deps: []
+
+flags: {}
+
+extra-package-dbs: []

@@ -1,0 +1,3 @@
+packages:
+    haskell/louter/louter.cabal
+    haskell/openai-mock/openai-mock.cabal

@@ -1,0 +1,28 @@
+cabal-version: 2.2
+name: openai-mock
+version: 0.1.0.0
+synopsis: Mock OpenAI server for testing
+description: Replays captured test-data responses for deterministic testing
+license: MIT
+author: Junji Hashimoto
+maintainer: junji.hashimoto@gmail.com
+category: Testing
+build-type: Simple
+
+executable openai-mock
+  main-is: Main.hs
+  hs-source-dirs: app
+  default-language: Haskell2010
+  ghc-options: -Wall -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+      base >=4.7 && <5
+    , louter
+    , aeson >=2.0
+    , bytestring >=0.11
+    , text >=2.0
+    , warp >=3.3
+    , wai >=3.2
+    , http-types >=0.12
+    , optparse-applicative >=0.17
+    , directory >=1.3
+    , filepath >=1.4
