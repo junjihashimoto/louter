@@ -73,6 +73,20 @@ executable louter-server
     , louter
     , optparse-applicative >=0.17
     , yaml >=0.11
+    , aeson
+    , bytestring
+    , text
+    , wai
+    , warp
+    , http-types
+    , http-client
+    , http-client-tls
+    , containers
+    , unordered-containers
+    , conduit
+    , transformers
+    , mtl
+    , vector
 
 test-suite louter-test
   type: exitcode-stdio-1.0

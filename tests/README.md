@@ -1,6 +1,20 @@
 # Testing Louter (LLM Router)
 
-This directory contains integration tests that can be used to test both the real APIs and your proxy implementation.
+This directory contains comprehensive integration tests using official Python SDKs to verify protocol compliance for OpenAI, Anthropic, and Gemini APIs.
+
+## Test Suites
+
+### Python SDK Tests (New!)
+Comprehensive protocol compliance tests using official SDKs:
+- **test_openai_streaming.py** - OpenAI API compliance (13 tests)
+- **test_anthropic_streaming.py** - Anthropic API compliance (15 tests)
+- **test_gemini_streaming.py** - Gemini API compliance (10 tests)
+- **run_all_tests.py** - Master test runner
+
+See [Python SDK Tests](#python-sdk-tests-recommended) section below for details.
+
+### Legacy Tests
+This directory also contains older integration tests for testing both real APIs and your proxy implementation.
 
 ## Environment Variables
 
@@ -126,6 +140,88 @@ Tests **Gemini passthrough**: Gemini requests through proxy to real Gemini API.
 | 3 | 3/3 tests pass (OpenAI→Gemini conversion) |
 
 When all phases pass, your proxy is fully functional! 🎉
+
+---
+
+## Python SDK Tests (Recommended)
+
+### Quick Start
+
+Install dependencies:
+```bash
+pip install openai anthropic google-generativeai
+```
+
+Run all tests:
+```bash
+# Sequential (default)
+python tests/run_all_tests.py
+
+# Parallel (faster)
+python tests/run_all_tests.py --parallel
+
+# Verbose output
+python tests/run_all_tests.py --verbose
+```
+
+Run specific suites:
+```bash
+python tests/run_all_tests.py --openai      # OpenAI only
+python tests/run_all_tests.py --anthropic   # Anthropic only
+python tests/run_all_tests.py --gemini      # Gemini only
+```
+
+### Test Coverage
+
+**OpenAI (13 tests)**
+- Text streaming, reasoning tokens, function calling (single & parallel)
+- Tool use round-trip, parameters (temperature, top_p, stop, max_tokens)
+- System messages, role handling, chunk ID consistency
+
+**Anthropic (15 tests)**
+- Event sequence validation, content block indexing
+- Tool use with id/name, multiple tools, round-trip
+- Token tracking (input/output), stop reasons
+- System messages, ping events, temperature
+
+**Gemini (10 tests)**
+- Text streaming, function calling, streaming consistency
+- Tool use round-trip, multiple functions
+- System instructions, temperature, max_output_tokens
+- Chat history, empty response handling
+
+### Environment Configuration
+
+```bash
+# OpenAI tests
+export OPENAI_BASE_URL="http://localhost:9000"
+export OPENAI_API_KEY="test-key"
+export OPENAI_MODEL="gpt-4"
+
+# Anthropic tests
+export ANTHROPIC_BASE_URL="http://localhost:9000"
+export ANTHROPIC_API_KEY="test-key"
+
+# Gemini tests
+export GOOGLE_GEMINI_BASE_URL="http://localhost:9000"
+export GOOGLE_API_KEY="test-key"
+```
+
+### Individual Test Files
+
+```bash
+python tests/test_openai_streaming.py
+python tests/test_anthropic_streaming.py
+python tests/test_gemini_streaming.py
+```
+
+### Why Python SDK Tests?
+
+1. **Real-world simulation** - Tests use the same SDKs that Claude Code, Cursor, and other agents use
+2. **Protocol compliance** - Verifies that proxy implements specs correctly
+3. **Comprehensive** - 38 total tests covering streaming, tools, parameters, edge cases
+4. **Fast development** - Python tests are easier to write and debug than Rust integration tests
+5. **CI/CD ready** - Can run in parallel for fast feedback
 
 ---
 
