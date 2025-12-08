@@ -11,7 +11,7 @@ import qualified Data.Aeson.KeyMap as HM
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Char8 as BS8
-import Data.ByteString.Builder (byteString)
+import Data.ByteString.Builder (Builder, byteString)
 import Data.Conduit ((.|), runConduit, await)
 import qualified Data.Conduit.List as CL
 import Data.Map.Strict (Map)
@@ -446,10 +446,524 @@ parseTools = mapM parseTool
 
 -- | /v1/messages - Anthropic endpoint
 anthropicMessagesHandler :: AppState -> Application
-anthropicMessagesHandler _state _req respond =
-  respond $ responseLBS status501
-    [("Content-Type", "application/json")]
-    (encode $ object ["error" .= ("Anthropic endpoint not yet implemented" :: Text)])
+anthropicMessagesHandler state req respond = do
+  -- Read request body
+  body <- strictRequestBody req
+
+  case eitherDecode body of
+    Left err -> respond $ responseLBS status400
+      [("Content-Type", "application/json")]
+      (encode $ object ["error" .= ("Invalid Anthropic request: " <> T.pack err :: Text)])
+
+    Right anthropicReq -> do
+      -- Check if streaming
+      let isStreaming = getAnthropicStreamFlag anthropicReq
+
+      if isStreaming
+        then handleAnthropicStreaming state anthropicReq respond
+        else handleAnthropicNonStreaming state anthropicReq respond
+
+-- | Get Anthropic stream flag
+getAnthropicStreamFlag :: Value -> Bool
+getAnthropicStreamFlag (Object obj) = case HM.lookup "stream" obj of
+  Just (Bool b) -> b
+  _ -> False
+getAnthropicStreamFlag _ = False
+
+-- | Handle Anthropic streaming request
+handleAnthropicStreaming :: AppState -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
+handleAnthropicStreaming state anthropicReq respond = do
+  -- Convert Anthropic request to OpenAI format
+  case anthropicToOpenAI anthropicReq of
+    Left err -> respond $ responseLBS status400
+      [("Content-Type", "application/json")]
+      (encode $ object ["error" .= err])
+
+    Right openAIReq -> do
+      -- Make request to backend
+      let backendUrl = "http://localhost:11211/v1/chat/completions"
+
+      req <- HTTP.parseRequest ("POST " <> backendUrl)
+      let req' = req
+            { HTTP.requestBody = HTTP.RequestBodyLBS (encode openAIReq)
+            , HTTP.requestHeaders = [("Content-Type", "application/json")]
+            }
+
+      -- Stream response and convert OpenAI SSE → Anthropic SSE
+      let sseResponse = responseStream status200
+            [ ("Content-Type", "text/event-stream")
+            , ("Cache-Control", "no-cache")
+            , ("Connection", "keep-alive")
+            ] $ \write flush -> do
+              withResponse req' (appManager state) $ \backendResp -> do
+                let body = HTTP.responseBody backendResp
+                -- Convert OpenAI chunks to Anthropic events
+                convertOpenAIToAnthropic write flush body
+
+      respond sseResponse
+
+-- | Handle Anthropic non-streaming request
+handleAnthropicNonStreaming :: AppState -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
+handleAnthropicNonStreaming state anthropicReq respond = do
+  case anthropicToOpenAI anthropicReq of
+    Left err -> respond $ responseLBS status400
+      [("Content-Type", "application/json")]
+      (encode $ object ["error" .= err])
+
+    Right openAIReq -> do
+      let backendUrl = "http://localhost:11211/v1/chat/completions"
+
+      req <- HTTP.parseRequest ("POST " <> backendUrl)
+      let req' = req
+            { HTTP.requestBody = HTTP.RequestBodyLBS (encode openAIReq)
+            , HTTP.requestHeaders = [("Content-Type", "application/json")]
+            }
+
+      response <- HTTP.httpLbs req' (appManager state)
+
+      -- Convert OpenAI response to Anthropic format
+      case eitherDecode (HTTP.responseBody response) of
+        Left err -> respond $ responseLBS status500
+          [("Content-Type", "application/json")]
+          (encode $ object ["error" .= ("Failed to parse backend response: " <> T.pack err :: Text)])
+
+        Right openAIResp -> do
+          let anthropicResp = openAIResponseToAnthropic openAIResp
+          respond $ responseLBS status200
+            [("Content-Type", "application/json")]
+            (encode anthropicResp)
+
+-- | Convert Anthropic request to OpenAI format
+anthropicToOpenAI :: Value -> Either Text Value
+anthropicToOpenAI (Object obj) = do
+  -- Extract messages
+  messages <- case HM.lookup "messages" obj of
+    Just (Array msgs) -> Right $ V.toList msgs
+    _ -> Left "Missing 'messages' field"
+
+  -- Extract max_tokens
+  let maxTokens = case HM.lookup "max_tokens" obj of
+        Just (Number n) -> Just (floor n :: Int)
+        _ -> Nothing
+
+  -- Extract optional fields
+  let temperature = case HM.lookup "temperature" obj of
+        Just (Number n) -> Just (realToFrac n :: Double)
+        _ -> Nothing
+
+  let model = case HM.lookup "model" obj of
+        Just (String m) -> m
+        _ -> "gpt-4"
+
+  -- Extract system message if present and prepend to messages
+  let systemMsg = case HM.lookup "system" obj of
+        Just (String sys) -> [object ["role" .= ("system" :: Text), "content" .= sys]]
+        _ -> []
+
+  -- Extract tools if present
+  let tools = case HM.lookup "tools" obj of
+        Just (Array ts) -> Just (Array ts)
+        _ -> Nothing
+
+  Right $ object $
+    [ "model" .= model
+    , "messages" .= (systemMsg ++ messages)
+    , "max_tokens" .= maxTokens
+    , "temperature" .= temperature
+    , "stream" .= True
+    ] ++ case tools of
+          Just t -> ["tools" .= t]
+          Nothing -> []
+
+anthropicToOpenAI _ = Left "Request must be a JSON object"
+
+-- | Convert OpenAI SSE stream to Anthropic SSE format
+convertOpenAIToAnthropic :: (Builder -> IO ()) -> IO () -> HTTP.BodyReader -> IO ()
+convertOpenAIToAnthropic write flush bodyReader = do
+  -- Send message_start event
+  write (byteString $ BS8.pack "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-haiku-20240307\",\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n")
+  flush
+
+  -- Send content_block_start
+  write (byteString $ BS8.pack "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n")
+  flush
+
+  -- Stream content deltas
+  streamContentDeltas write flush bodyReader 0
+
+  -- Send content_block_stop
+  write (byteString $ BS8.pack "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n")
+  flush
+
+  -- Send message_delta with stop_reason
+  write (byteString $ BS8.pack "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":10}}\n\n")
+  flush
+
+  -- Send message_stop
+  write (byteString $ BS8.pack "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+  flush
+
+-- | Stream content deltas from OpenAI response
+streamContentDeltas :: (Builder -> IO ()) -> IO () -> HTTP.BodyReader -> Int -> IO ()
+streamContentDeltas write flush bodyReader contentIndex = loop BS.empty
+  where
+    loop acc = do
+      chunk <- brRead bodyReader
+      if BS.null chunk
+        then pure ()
+        else do
+          let combined = acc <> chunk
+              lines' = BS.split (fromIntegral $ fromEnum '\n') combined
+          case lines' of
+            [] -> loop BS.empty
+            [incomplete] -> loop incomplete
+            _ -> do
+              let (completeLines, rest) = (init lines', last lines')
+              mapM_ (processOpenAILine write flush contentIndex) completeLines
+              loop rest
+
+-- | Process a single OpenAI SSE line and convert to Anthropic format
+processOpenAILine :: (Builder -> IO ()) -> IO () -> Int -> BS.ByteString -> IO ()
+processOpenAILine write flush contentIndex line
+  | BS.isPrefixOf "data: " line = do
+      let jsonText = TE.decodeUtf8 $ BS.drop 6 line
+      if jsonText == "[DONE]"
+        then pure ()  -- Don't send [DONE] in Anthropic format
+        else case eitherDecode (BL.fromStrict $ TE.encodeUtf8 jsonText) of
+          Right (Object openAIChunk) -> do
+            -- Extract content delta
+            case HM.lookup "choices" openAIChunk of
+              Just (Array choices) | not (V.null choices) -> do
+                case V.head choices of
+                  Object choice -> do
+                    case HM.lookup "delta" choice of
+                      Just (Object delta) -> do
+                        -- Check for content
+                        case HM.lookup "content" delta of
+                          Just (String content) -> do
+                            let anthropicEvent = object
+                                  [ "type" .= ("content_block_delta" :: Text)
+                                  , "index" .= contentIndex
+                                  , "delta" .= object
+                                      [ "type" .= ("text_delta" :: Text)
+                                      , "text" .= content
+                                      ]
+                                  ]
+                            write (byteString $ BS8.pack "event: content_block_delta\ndata: " <> BL.toStrict (encode anthropicEvent) <> BS8.pack "\n\n")
+                            flush
+                          _ -> pure ()
+
+                        -- Check for reasoning (treat as content for now)
+                        case HM.lookup "reasoning" delta of
+                          Just (String reasoning) -> do
+                            let anthropicEvent = object
+                                  [ "type" .= ("content_block_delta" :: Text)
+                                  , "index" .= contentIndex
+                                  , "delta" .= object
+                                      [ "type" .= ("text_delta" :: Text)
+                                      , "text" .= reasoning
+                                      ]
+                                  ]
+                            write (byteString $ BS8.pack "event: content_block_delta\ndata: " <> BL.toStrict (encode anthropicEvent) <> BS8.pack "\n\n")
+                            flush
+                          _ -> pure ()
+                      _ -> pure ()
+                  _ -> pure ()
+              _ -> pure ()
+          _ -> pure ()
+  | otherwise = pure ()
+
+-- | Convert OpenAI non-streaming response to Anthropic format
+openAIResponseToAnthropic :: Value -> Value
+openAIResponseToAnthropic (Object openAIResp) =
+  let content = case HM.lookup "choices" openAIResp of
+        Just (Array choices) | not (V.null choices) ->
+          case V.head choices of
+            Object choice -> case HM.lookup "message" choice of
+              Just (Object msg) -> case HM.lookup "content" msg of
+                Just (String txt) -> [object ["type" .= ("text" :: Text), "text" .= txt]]
+                _ -> []
+              _ -> []
+            _ -> []
+        _ -> []
+  in object
+      [ "id" .= ("msg_1" :: Text)
+      , "type" .= ("message" :: Text)
+      , "role" .= ("assistant" :: Text)
+      , "content" .= content
+      , "model" .= ("claude-3-haiku-20240307" :: Text)
+      , "stop_reason" .= ("end_turn" :: Text)
+      , "usage" .= object
+          [ "input_tokens" .= (10 :: Int)
+          , "output_tokens" .= (10 :: Int)
+          ]
+      ]
+openAIResponseToAnthropic _ = object []
+
+-- ==============================================================================
+-- Gemini API Handlers
+-- ==============================================================================
+
+-- | Handle Gemini streaming request
+handleGeminiStreaming :: AppState -> Text -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
+handleGeminiStreaming state modelName geminiReq respond = do
+  case geminiToOpenAI modelName geminiReq of
+    Left err -> respond $ responseLBS status400
+      [("Content-Type", "application/json")]
+      (encode $ object ["error" .= err])
+
+    Right openAIReq -> do
+      -- Create backend HTTP request
+      let backendUrl = "http://localhost:11211/v1/chat/completions"
+      req <- HTTP.parseRequest ("POST " <> backendUrl)
+      let req' = req
+            { HTTP.requestBody = HTTP.RequestBodyLBS (encode openAIReq)
+            , HTTP.requestHeaders = [("Content-Type", "application/json")]
+            }
+
+      -- Stream response and convert OpenAI SSE → Gemini SSE
+      -- Note: Gemini uses SSE format with "data: {...}\n\n" (NOT arrays)
+      let streamResponse = responseStream status200
+            [ ("Content-Type", "text/event-stream; charset=utf-8")
+            , ("Cache-Control", "no-cache")
+            , ("Connection", "keep-alive")
+            ] $ \write flush -> do
+              withResponse req' (appManager state) $ \backendResp -> do
+                let body = HTTP.responseBody backendResp
+                -- Convert OpenAI SSE to Gemini SSE
+                convertOpenAIToGeminiStream write flush body
+
+      respond streamResponse
+
+-- | Handle Gemini non-streaming request
+handleGeminiNonStreaming :: AppState -> Text -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
+handleGeminiNonStreaming state modelName geminiReq respond = do
+  case geminiToOpenAI modelName geminiReq of
+    Left err -> respond $ responseLBS status400
+      [("Content-Type", "application/json")]
+      (encode $ object ["error" .= err])
+
+    Right openAIReq -> do
+      -- Create backend HTTP request
+      let backendUrl = "http://localhost:11211/v1/chat/completions"
+      req <- HTTP.parseRequest ("POST " <> backendUrl)
+      let req' = req
+            { HTTP.requestBody = HTTP.RequestBodyLBS (encode openAIReq)
+            , HTTP.requestHeaders = [("Content-Type", "application/json")]
+            }
+
+      -- Make synchronous request
+      httpResp <- HTTP.httpLbs req' (appManager state)
+      let responseBody' = HTTP.responseBody httpResp
+
+      -- Convert OpenAI response to Gemini format
+      case eitherDecode responseBody' of
+        Left err -> respond $ responseLBS status500
+          [("Content-Type", "application/json")]
+          (encode $ object ["error" .= ("Failed to parse backend response: " <> T.pack err :: Text)])
+
+        Right openAIResp ->
+          respond $ responseLBS status200
+            [("Content-Type", "application/json")]
+            (encode $ openAIResponseToGemini openAIResp)
+
+-- | Convert Gemini request to OpenAI format
+geminiToOpenAI :: Text -> Value -> Either Text Value
+geminiToOpenAI modelName (Object obj) = do
+  -- Extract contents array
+  contents <- case HM.lookup "contents" obj of
+    Just (Array cs) -> Right $ V.toList cs
+    _ -> Left "Missing 'contents' field"
+
+  -- Convert contents to OpenAI messages
+  messages <- mapM convertGeminiContentToMessage contents
+
+  -- Extract system instruction if present
+  let systemMsg = case HM.lookup "systemInstruction" obj of
+        Just (Object sysInst) -> case HM.lookup "parts" sysInst of
+          Just (Array parts) | not (V.null parts) ->
+            case V.head parts of
+              Object part -> case HM.lookup "text" part of
+                Just (String txt) -> [object ["role" .= ("system" :: Text), "content" .= txt]]
+                _ -> []
+              _ -> []
+          _ -> []
+        _ -> []
+
+  -- Extract generation config
+  let temperature = case HM.lookup "generationConfig" obj of
+        Just (Object cfg) -> HM.lookup "temperature" cfg
+        _ -> Nothing
+
+  let maxTokens = case HM.lookup "generationConfig" obj of
+        Just (Object cfg) -> HM.lookup "maxOutputTokens" cfg
+        _ -> Nothing
+
+  -- Extract tools
+  let tools = case HM.lookup "tools" obj of
+        Just (Array ts) -> Just $ V.toList ts
+        _ -> Nothing
+
+  Right $ object $
+    [ "model" .= modelName
+    , "messages" .= (systemMsg ++ messages)
+    , "stream" .= True
+    ] ++ (case temperature of Just t -> ["temperature" .= t]; Nothing -> [])
+      ++ (case maxTokens of Just m -> ["max_tokens" .= m]; Nothing -> [])
+      ++ (case tools of Just t -> ["tools" .= convertGeminiToolsToOpenAI t]; Nothing -> [])
+
+geminiToOpenAI _ _ = Left "Request must be a JSON object"
+
+-- | Convert Gemini content to OpenAI message
+convertGeminiContentToMessage :: Value -> Either Text Value
+convertGeminiContentToMessage (Object content) = do
+  role <- case HM.lookup "role" content of
+    Just (String r) -> Right r
+    _ -> Right "user"  -- Default to user
+
+  parts <- case HM.lookup "parts" content of
+    Just (Array ps) -> Right $ V.toList ps
+    _ -> Left "Missing 'parts' in content"
+
+  -- For now, just extract text from first part
+  -- TODO: Handle multiple parts, inlineData, functionCall, functionResponse
+  let textContent = case parts of
+        (Object part : _) -> case HM.lookup "text" part of
+          Just (String txt) -> txt
+          _ -> ""
+        _ -> ""
+
+  Right $ object
+    [ "role" .= role
+    , "content" .= textContent
+    ]
+
+convertGeminiContentToMessage _ = Left "Content must be a JSON object"
+
+-- | Convert Gemini tools to OpenAI format
+convertGeminiToolsToOpenAI :: [Value] -> [Value]
+convertGeminiToolsToOpenAI = map convertTool
+  where
+    convertTool (Object tool) =
+      case HM.lookup "functionDeclarations" tool of
+        Just (Array funcs) -> object
+          [ "type" .= ("function" :: Text)
+          , "function" .= V.head funcs  -- TODO: Handle multiple declarations
+          ]
+        _ -> object []
+    convertTool _ = object []
+
+-- | Convert OpenAI SSE stream to Gemini newline-delimited JSON format
+convertOpenAIToGeminiStream :: (Builder -> IO ()) -> IO () -> HTTP.BodyReader -> IO ()
+convertOpenAIToGeminiStream write flush bodyReader = do
+  streamGeminiDeltas write flush bodyReader
+
+-- | Stream Gemini deltas from OpenAI response
+streamGeminiDeltas :: (Builder -> IO ()) -> IO () -> HTTP.BodyReader -> IO ()
+streamGeminiDeltas write flush bodyReader = loop BS.empty
+  where
+    loop acc = do
+      chunk <- brRead bodyReader
+      if BS.null chunk
+        then pure ()
+        else do
+          let combined = acc <> chunk
+              lines' = BS.split (fromIntegral $ fromEnum '\n') combined
+          case lines' of
+            [] -> loop BS.empty
+            [incomplete] -> loop incomplete
+            _ -> do
+              let (completeLines, rest) = (init lines', last lines')
+              mapM_ (processOpenAILineToGemini write flush) completeLines
+              loop rest
+
+-- | Process a single OpenAI SSE line and convert to Gemini SSE
+processOpenAILineToGemini :: (Builder -> IO ()) -> IO () -> BS.ByteString -> IO ()
+processOpenAILineToGemini write flush line
+  | BS.isPrefixOf "data: " line = do
+      let jsonText = TE.decodeUtf8 $ BS.drop 6 line
+      if jsonText == "[DONE]"
+        then pure ()  -- Gemini doesn't send [DONE]
+        else case eitherDecode (BL.fromStrict $ TE.encodeUtf8 jsonText) of
+          Right (Object openAIChunk) -> do
+            -- Convert to Gemini SSE format: "data: {...}\n\n"
+            let geminiChunk = openAIChunkToGemini openAIChunk
+            write (byteString $ BS8.pack "data: " <> BL.toStrict (encode geminiChunk) <> BS8.pack "\n\n")
+            flush
+          _ -> pure ()
+  | otherwise = pure ()
+
+-- | Convert OpenAI chunk to Gemini chunk
+openAIChunkToGemini :: HM.KeyMap Value -> Value
+openAIChunkToGemini openAIChunk =
+  let candidates = case HM.lookup "choices" openAIChunk of
+        Just (Array choices) | not (V.null choices) ->
+          V.toList $ V.map convertChoice choices
+        _ -> []
+  in object
+      [ "candidates" .= candidates
+      , "usageMetadata" .= object
+          [ "promptTokenCount" .= (0 :: Int)
+          , "candidatesTokenCount" .= (0 :: Int)
+          , "totalTokenCount" .= (0 :: Int)
+          ]
+      ]
+  where
+    convertChoice (Object choice) =
+      let delta = case HM.lookup "delta" choice of
+            Just (Object d) -> d
+            _ -> HM.empty
+          finishReason = HM.lookup "finish_reason" choice
+          -- Extract text from either content or reasoning
+          parts = case (HM.lookup "content" delta, HM.lookup "reasoning" delta) of
+            (Just (String txt), _) -> [object ["text" .= txt]]
+            (_, Just (String txt)) -> [object ["text" .= txt]]
+            _ -> []
+      in object $
+          [ "content" .= object
+              [ "parts" .= parts
+              , "role" .= ("model" :: Text)
+              ]
+          ] ++ (case finishReason of
+                  Just r -> ["finishReason" .= r]
+                  Nothing -> [])
+    convertChoice _ = object []
+
+-- | Convert OpenAI non-streaming response to Gemini format
+openAIResponseToGemini :: Value -> Value
+openAIResponseToGemini (Object openAIResp) =
+  let candidates = case HM.lookup "choices" openAIResp of
+        Just (Array choices) | not (V.null choices) ->
+          V.toList $ V.map convertChoice choices
+        _ -> []
+  in object
+      [ "candidates" .= candidates
+      , "usageMetadata" .= object
+          [ "promptTokenCount" .= (0 :: Int)
+          , "candidatesTokenCount" .= (0 :: Int)
+          , "totalTokenCount" .= (0 :: Int)
+          ]
+      ]
+  where
+    convertChoice (Object choice) =
+      let message = case HM.lookup "message" choice of
+            Just (Object m) -> m
+            _ -> HM.empty
+          finishReason = HM.lookup "finish_reason" choice
+          content = HM.lookup "content" message
+          parts = case content of
+            Just (String txt) -> [object ["text" .= txt]]
+            _ -> []
+      in object $
+          [ "content" .= object
+              [ "parts" .= parts
+              , "role" .= ("model" :: Text)
+              ]
+          ] ++ (case finishReason of
+                  Just r -> ["finishReason" .= r]
+                  Nothing -> [])
+    convertChoice _ = object []
+openAIResponseToGemini _ = object []
 
 -- | /v1beta/models - Gemini list models
 geminiListModelsHandler :: AppState -> Application
@@ -460,10 +974,34 @@ geminiListModelsHandler _state _req respond =
 
 -- | /v1beta/models/:model:action - Gemini model actions
 geminiModelActionHandler :: AppState -> [Text] -> Application
-geminiModelActionHandler _state _modelPath _req respond =
-  respond $ responseLBS status501
-    [("Content-Type", "application/json")]
-    (encode $ object ["error" .= ("Gemini model actions not yet implemented" :: Text)])
+geminiModelActionHandler state modelPath req respond = do
+  -- Parse model and action from path
+  -- Path format: ["model-name:streamGenerateContent"] or ["model-name:generateContent"]
+  case modelPath of
+    [] -> respond $ responseLBS status400
+      [("Content-Type", "application/json")]
+      (encode $ object ["error" .= ("Missing model path" :: Text)])
+
+    (fullPath:_) -> do
+      -- Split on ':' to get model and action
+      let parts = T.splitOn ":" fullPath
+      case parts of
+        [modelName, action] -> do
+          -- Read request body
+          body <- strictRequestBody req
+          case eitherDecode body of
+            Left err -> respond $ responseLBS status400
+              [("Content-Type", "application/json")]
+              (encode $ object ["error" .= ("Invalid Gemini request: " <> T.pack err :: Text)])
+
+            Right geminiReq -> do
+              if action == "streamGenerateContent"
+                then handleGeminiStreaming state modelName geminiReq respond
+                else handleGeminiNonStreaming state modelName geminiReq respond
+
+        _ -> respond $ responseLBS status400
+          [("Content-Type", "application/json")]
+          (encode $ object ["error" .= ("Invalid model path format" :: Text)])
 
 -- | /api/diagnostics endpoint
 diagnosticsHandler :: AppState -> Application

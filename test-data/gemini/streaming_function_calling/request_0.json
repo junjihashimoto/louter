@@ -1,0 +1,37 @@
+{
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "今日の東京の天気を教えて"
+          }
+        ]
+      }
+    ],
+    "tools": [
+      {
+        "function_declarations": [
+          {
+            "name": "getWeather",
+            "description": "指定された都市の現在の天気を取得する",
+            "parameters": {
+              "type": "OBJECT",
+              "properties": {
+                "location": {
+                  "type": "STRING",
+                  "description": "都市名。例: Tokyo, San Francisco"
+                },
+                "unit": {
+                  "type": "STRING",
+                  "description": "温度単位: celsius or fahrenheit",
+                  "enum": [ "celsius", "fahrenheit" ]
+                }
+              },
+              "required": [ "location" ]
+            }
+          }
+        ]
+      }
+    ]
+  }

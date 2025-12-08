@@ -1,0 +1,4 @@
+data: {"candidates": [{"content": {"parts": [{"text": "今日の東京の天気"}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 138,"candidatesTokenCount": 4,"totalTokenCount": 142,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 138}]},"modelVersion": "gemini-2.5-flash","responseId": "45I2aaWZBumm2roPm8HR0Ao"}
+
+data: {"candidates": [{"content": {"parts": [{"text": "は曇りで、気温は22度です。\n"}],"role": "model"},"finishReason": "STOP","index": 0}],"usageMetadata": {"promptTokenCount": 138,"candidatesTokenCount": 15,"totalTokenCount": 153,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 138}]},"modelVersion": "gemini-2.5-flash","responseId": "45I2aaWZBumm2roPm8HR0Ao"}
+

@@ -1,0 +1,1 @@
+nix-shell -p 'python3.withPackages (ps: with ps; [httpx pip fastapi uvicorn litellm python-dotenv anthropic google-genai google-generativeai])' rustc cargo clippy rustfmt gcc cabal-install haskell.compiler.ghc967 zlib.dev
