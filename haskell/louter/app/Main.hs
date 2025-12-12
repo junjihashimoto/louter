@@ -759,7 +759,10 @@ handleGeminiStreaming :: Text -> AppState -> Text -> Value -> (Response -> IO Re
 handleGeminiStreaming traceId state modelName geminiReq respond = do
   case geminiToOpenAI modelName True geminiReq of
     Left err -> do
-      logEvent traceId "gemini_to_openai_error" $ object ["error" .= err]
+      logEvent traceId "gemini_to_openai_error" $ object
+        [ "error" .= err
+        , "model" .= modelName
+        ]
       respond $ responseLBS status400
         [("Content-Type", "application/json")]
         (encode $ object ["error" .= err])
@@ -769,6 +772,7 @@ handleGeminiStreaming traceId state modelName geminiReq respond = do
       logEvent traceId "openai_request" $ object
         [ "backend_url" .= ("http://localhost:11211/v1/chat/completions" :: Text)
         , "request" .= openAIReq
+        , "streaming" .= True
         ]
 
       -- Create backend HTTP request
@@ -793,22 +797,36 @@ handleGeminiStreaming traceId state modelName geminiReq respond = do
                 -- Log backend response status
                 logEvent traceId "backend_response" $ object
                   [ "status" .= show statusCode
+                  , "streaming" .= True
                   ]
 
                 -- Convert OpenAI SSE to Gemini SSE
                 convertOpenAIToGeminiStream write flush body
 
+      logEvent traceId "streaming_started" $ object ["status" .= ("ok" :: Text)]
       respond streamResponse
 
 -- | Handle Gemini non-streaming request
 handleGeminiNonStreaming :: Text -> AppState -> Text -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
 handleGeminiNonStreaming traceId state modelName geminiReq respond = do
   case geminiToOpenAI modelName False geminiReq of
-    Left err -> respond $ responseLBS status400
-      [("Content-Type", "application/json")]
-      (encode $ object ["error" .= err])
+    Left err -> do
+      logEvent traceId "gemini_to_openai_error" $ object
+        [ "error" .= err
+        , "model" .= modelName
+        ]
+      respond $ responseLBS status400
+        [("Content-Type", "application/json")]
+        (encode $ object ["error" .= err])
 
     Right openAIReq -> do
+      -- Log converted OpenAI request
+      logEvent traceId "openai_request" $ object
+        [ "backend_url" .= ("http://localhost:11211/v1/chat/completions" :: Text)
+        , "request" .= openAIReq
+        , "streaming" .= False
+        ]
+
       -- Create backend HTTP request
       let backendUrl = "http://localhost:11211/v1/chat/completions"
       req <- HTTP.parseRequest ("POST " <> backendUrl)
@@ -820,14 +838,29 @@ handleGeminiNonStreaming traceId state modelName geminiReq respond = do
       -- Make synchronous request
       httpResp <- HTTP.httpLbs req' (appManager state)
       let responseBody' = HTTP.responseBody httpResp
+          statusCode = HTTP.responseStatus httpResp
+
+      -- Log backend response status
+      logEvent traceId "backend_response" $ object
+        [ "status" .= show statusCode
+        , "body_length" .= BL.length responseBody'
+        ]
 
       -- Convert OpenAI response to Gemini format
       case eitherDecode responseBody' of
-        Left err -> respond $ responseLBS status500
-          [("Content-Type", "application/json")]
-          (encode $ object ["error" .= ("Failed to parse backend response: " <> T.pack err :: Text)])
+        Left err -> do
+          logEvent traceId "backend_parse_error" $ object
+            [ "error" .= T.pack err
+            , "body_preview" .= T.take 200 (TE.decodeUtf8 (BL.toStrict responseBody'))
+            ]
+          respond $ responseLBS status500
+            [("Content-Type", "application/json")]
+            (encode $ object ["error" .= ("Failed to parse backend response: " <> T.pack err :: Text)])
 
-        Right openAIResp ->
+        Right openAIResp -> do
+          logEvent traceId "response_success" $ object
+            [ "status" .= ("ok" :: Text)
+            ]
           respond $ responseLBS status200
             [("Content-Type", "application/json")]
             (encode $ openAIResponseToGemini openAIResp)
