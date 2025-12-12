@@ -23,6 +23,10 @@ library
       Louter.Protocol.OpenAI
       Louter.Protocol.Gemini
       Louter.Protocol.Anthropic
+      Louter.Protocol.AnthropicConverter
+      Louter.Protocol.AnthropicStreaming
+      Louter.Protocol.GeminiConverter
+      Louter.Protocol.GeminiStreaming
       -- Streaming infrastructure
       Louter.Streaming.Parser
       Louter.Streaming.Processor
