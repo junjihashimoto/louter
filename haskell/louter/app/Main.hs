@@ -5,6 +5,7 @@
 -- Routes requests between different LLM protocols using raw WAI
 module Main where
 
+import Control.Monad (foldM)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value(..), encode, eitherDecode, object, (.=))
 import qualified Data.Aeson.KeyMap as HM
@@ -983,37 +984,92 @@ convertGeminiContentToMessage (Object content) = do
     Just (String r) -> Right r
     _ -> Right "user"  -- Default to user
 
+  -- Convert Gemini roles to OpenAI roles
+  -- Gemini uses "model", OpenAI uses "assistant"
+  let openAIRole = if role == "model" then "assistant" else role
+
   parts <- case HM.lookup "parts" content of
     Just (Array ps) -> Right $ V.toList ps
     _ -> Left "Missing 'parts' in content"
 
-  -- For now, just extract text from first part
-  -- TODO: Handle multiple parts, inlineData, functionCall, functionResponse
-  let textContent = case parts of
-        (Object part : _) -> case HM.lookup "text" part of
-          Just (String txt) -> txt
-          _ -> ""
-        _ -> ""
+  -- Check if any part is a functionResponse (tool result)
+  let hasFunctionResponse = any isFunctionResponse parts
 
-  Right $ object
-    [ "role" .= role
-    , "content" .= textContent
-    ]
+  if hasFunctionResponse && not (null parts)
+    then do
+      -- Convert function response to OpenAI tool message format
+      -- Gemini can have multiple function responses in one message
+      let toolMessages = map convertFunctionResponsePart (filter isFunctionResponse parts)
+      -- For now, return the first tool message (OpenAI expects one tool result per message)
+      case toolMessages of
+        (msg:_) -> Right msg
+        [] -> Left "Function response part missing required fields"
+    else do
+      -- Regular text content
+      let textContent = case parts of
+            (Object part : _) -> case HM.lookup "text" part of
+              Just (String txt) -> txt
+              _ -> ""
+            _ -> ""
+
+      Right $ object
+        [ "role" .= openAIRole
+        , "content" .= textContent
+        ]
+  where
+    isFunctionResponse (Object part) = HM.member "functionResponse" part
+    isFunctionResponse _ = False
+
+    convertFunctionResponsePart (Object part) =
+      case HM.lookup "functionResponse" part of
+        Just (Object funcResp) ->
+          let funcName = case HM.lookup "name" funcResp of
+                Just (String n) -> n
+                _ -> "unknown"
+              funcResult = case HM.lookup "response" funcResp of
+                Just resp -> encode resp
+                _ -> "{}"
+              -- Generate a tool_call_id (in real Gemini API, this would come from the original call)
+              -- For now, use the function name as ID
+              toolCallId = funcName <> "_result"
+          in object
+              [ "role" .= ("tool" :: Text)
+              , "content" .= TE.decodeUtf8 (BL.toStrict funcResult)
+              , "tool_call_id" .= toolCallId
+              ]
+        _ -> object []
+    convertFunctionResponsePart _ = object []
 
 convertGeminiContentToMessage _ = Left "Content must be a JSON object"
 
 -- | Convert Gemini tools to OpenAI format
 convertGeminiToolsToOpenAI :: [Value] -> [Value]
-convertGeminiToolsToOpenAI = map convertTool
+convertGeminiToolsToOpenAI = concatMap convertTool
   where
     convertTool (Object tool) =
       case HM.lookup "functionDeclarations" tool of
-        Just (Array funcs) -> object
+        Just (Array funcs) -> map (\func -> object
           [ "type" .= ("function" :: Text)
-          , "function" .= V.head funcs  -- TODO: Handle multiple declarations
-          ]
-        _ -> object []
-    convertTool _ = object []
+          , "function" .= convertFunctionDeclaration func
+          ]) (V.toList funcs)
+        _ -> []
+    convertTool _ = []
+
+    -- Convert Gemini function declaration to OpenAI format
+    -- Rename "parametersJsonSchema" to "parameters"
+    convertFunctionDeclaration (Object funcObj) =
+      let renamedObj = case HM.lookup "parametersJsonSchema" funcObj of
+            Just params -> HM.insert "parameters" params (HM.delete "parametersJsonSchema" funcObj)
+            Nothing -> funcObj
+      in Object renamedObj
+    convertFunctionDeclaration other = other
+
+-- | State for tracking tool call arguments during streaming
+data ToolCallState = ToolCallState
+  { toolCallId :: Maybe Text
+  , toolCallName :: Maybe Text
+  , toolCallArgs :: Text  -- Accumulated arguments string
+  } deriving (Show)
 
 -- | Convert OpenAI SSE stream to Gemini newline-delimited JSON format
 convertOpenAIToGeminiStream :: (Builder -> IO ()) -> IO () -> HTTP.BodyReader -> IO ()
@@ -1022,9 +1078,9 @@ convertOpenAIToGeminiStream write flush bodyReader = do
 
 -- | Stream Gemini deltas from OpenAI response
 streamGeminiDeltas :: (Builder -> IO ()) -> IO () -> HTTP.BodyReader -> IO ()
-streamGeminiDeltas write flush bodyReader = loop BS.empty
+streamGeminiDeltas write flush bodyReader = loop BS.empty (ToolCallState Nothing Nothing "")
   where
-    loop acc = do
+    loop acc toolState = do
       chunk <- brRead bodyReader
       if BS.null chunk
         then pure ()
@@ -1032,28 +1088,146 @@ streamGeminiDeltas write flush bodyReader = loop BS.empty
           let combined = acc <> chunk
               lines' = BS.split (fromIntegral $ fromEnum '\n') combined
           case lines' of
-            [] -> loop BS.empty
-            [incomplete] -> loop incomplete
+            [] -> loop BS.empty toolState
+            [incomplete] -> loop incomplete toolState
             _ -> do
               let (completeLines, rest) = (init lines', last lines')
-              mapM_ (processOpenAILineToGemini write flush) completeLines
-              loop rest
+              newToolState <- foldM (processOpenAILineToGeminiStateful write flush) toolState completeLines
+              loop rest newToolState
 
--- | Process a single OpenAI SSE line and convert to Gemini SSE
-processOpenAILineToGemini :: (Builder -> IO ()) -> IO () -> BS.ByteString -> IO ()
-processOpenAILineToGemini write flush line
+-- | Process a single OpenAI SSE line with state tracking for tool calls
+processOpenAILineToGeminiStateful :: (Builder -> IO ()) -> IO () -> ToolCallState -> BS.ByteString -> IO ToolCallState
+processOpenAILineToGeminiStateful write flush toolState line
   | BS.isPrefixOf "data: " line = do
       let jsonText = TE.decodeUtf8 $ BS.drop 6 line
       if jsonText == "[DONE]"
-        then pure ()  -- Gemini doesn't send [DONE]
+        then pure toolState  -- Gemini doesn't send [DONE]
         else case eitherDecode (BL.fromStrict $ TE.encodeUtf8 jsonText) of
           Right (Object openAIChunk) -> do
-            -- Convert to Gemini SSE format: "data: {...}\n\n"
-            let geminiChunk = openAIChunkToGemini openAIChunk
-            write (byteString $ BS8.pack "data: " <> BL.toStrict (encode geminiChunk) <> BS8.pack "\n\n")
-            flush
-          _ -> pure ()
-  | otherwise = pure ()
+            -- Check if this chunk contains tool_calls
+            let hasToolCalls = case HM.lookup "choices" openAIChunk of
+                  Just (Array choices) | not (V.null choices) ->
+                    case V.head choices of
+                      Object choice -> case HM.lookup "delta" choice of
+                        Just (Object delta) -> HM.member "tool_calls" delta
+                        _ -> False
+                      _ -> False
+                  _ -> False
+
+            -- Check if this is a finish_reason = "tool_calls" chunk with buffered state
+            let finishReason = case HM.lookup "choices" openAIChunk of
+                  Just (Array choices) | not (V.null choices) ->
+                    case V.head choices of
+                      Object choice -> HM.lookup "finish_reason" choice
+                      _ -> Nothing
+                  _ -> Nothing
+                hasBufferedToolCall = toolCallName toolState /= Nothing
+
+            if hasToolCalls
+              then do
+                -- Process tool call and update state
+                (newState, maybeGeminiChunk) <- processToolCallChunk toolState openAIChunk
+                case maybeGeminiChunk of
+                  Just geminiChunk -> do
+                    write (byteString $ BS8.pack "data: " <> BL.toStrict (encode geminiChunk) <> BS8.pack "\n\n")
+                    flush
+                  Nothing -> pure ()
+                pure newState
+              else if finishReason == Just (String "tool_calls") && hasBufferedToolCall
+                then do
+                  -- Emit buffered tool call
+                  (newState, maybeGeminiChunk) <- processToolCallChunk toolState openAIChunk
+                  case maybeGeminiChunk of
+                    Just geminiChunk -> do
+                      write (byteString $ BS8.pack "data: " <> BL.toStrict (encode geminiChunk) <> BS8.pack "\n\n")
+                      flush
+                    Nothing -> pure ()
+                  pure newState
+                else do
+                  -- Regular text/reasoning chunk
+                  let geminiChunk = openAIChunkToGemini openAIChunk
+                  write (byteString $ BS8.pack "data: " <> BL.toStrict (encode geminiChunk) <> BS8.pack "\n\n")
+                  flush
+                  pure toolState
+          _ -> pure toolState
+  | otherwise = pure toolState
+
+-- | Process tool call chunk, accumulating arguments until complete
+processToolCallChunk :: ToolCallState -> HM.KeyMap Value -> IO (ToolCallState, Maybe Value)
+processToolCallChunk state openAIChunk = do
+  let choices = case HM.lookup "choices" openAIChunk of
+        Just (Array cs) | not (V.null cs) -> V.head cs
+        _ -> Object HM.empty
+      delta = case choices of
+        Object choice -> case HM.lookup "delta" choice of
+          Just (Object d) -> d
+          _ -> HM.empty
+        _ -> HM.empty
+      toolCalls = case HM.lookup "tool_calls" delta of
+        Just (Array tcs) | not (V.null tcs) -> Just $ V.head tcs
+        _ -> Nothing
+      finishReason = case choices of
+        Object choice -> HM.lookup "finish_reason" choice
+        _ -> Nothing
+
+  -- Check if we should emit based on finish_reason, even without new tool_calls
+  case finishReason of
+    Just (String "tool_calls") | toolCallName state /= Nothing -> do
+      -- Arguments are complete, emit the buffered function call
+      let parsedArgs = case eitherDecode (BL.fromStrict $ TE.encodeUtf8 (toolCallArgs state)) of
+            Right val -> val
+            Left _ -> object []
+          geminiChunk = object
+            [ "candidates" .= [object
+                [ "content" .= object
+                    [ "parts" .= [object $
+                        [ "functionCall" .= object
+                            ([ "name" .= n | Just n <- [toolCallName state] ] ++
+                             [ "args" .= parsedArgs ])
+                        ] ++ [ "id" .= i | Just i <- [toolCallId state] ]]
+                    , "role" .= ("model" :: Text)
+                    ]
+                , "finishReason" .= ("tool_calls" :: Text)
+                ]]
+            , "usageMetadata" .= object
+                [ "promptTokenCount" .= (0 :: Int)
+                , "candidatesTokenCount" .= (0 :: Int)
+                , "totalTokenCount" .= (0 :: Int)
+                ]
+            ]
+      -- Reset state for next tool call
+      pure (ToolCallState Nothing Nothing "", Just geminiChunk)
+    _ -> do
+      -- Process new tool_calls delta if present
+      case toolCalls of
+        Just (Object tc) -> do
+          let tcId = case HM.lookup "id" tc of
+                Just (String i) -> Just i
+                _ -> Nothing
+              tcFunc = case HM.lookup "function" tc of
+                Just (Object f) -> f
+                _ -> HM.empty
+              funcName = case HM.lookup "name" tcFunc of
+                Just (String n) -> Just n
+                _ -> Nothing
+              funcArgs = case HM.lookup "arguments" tcFunc of
+                Just (String args) -> args
+                _ -> ""
+
+          -- Update state with new information
+          let newId = case tcId of Just i -> Just i; Nothing -> toolCallId state
+              newName = case funcName of Just n -> Just n; Nothing -> toolCallName state
+              newArgs = toolCallArgs state <> funcArgs
+
+          -- Still accumulating, don't emit yet
+          pure (ToolCallState newId newName newArgs, Nothing)
+        _ -> pure (state, Nothing)
+
+-- | Process a single OpenAI SSE line and convert to Gemini SSE (stateless version, kept for compatibility)
+processOpenAILineToGemini :: (Builder -> IO ()) -> IO () -> BS.ByteString -> IO ()
+processOpenAILineToGemini write flush line = do
+  _ <- processOpenAILineToGeminiStateful write flush (ToolCallState Nothing Nothing "") line
+  pure ()
 
 -- | Convert OpenAI chunk to Gemini chunk
 openAIChunkToGemini :: HM.KeyMap Value -> Value
@@ -1077,10 +1251,15 @@ openAIChunkToGemini openAIChunk =
             _ -> HM.empty
           finishReason = HM.lookup "finish_reason" choice
           -- Extract text from either content or reasoning
-          parts = case (HM.lookup "content" delta, HM.lookup "reasoning" delta) of
+          textParts = case (HM.lookup "content" delta, HM.lookup "reasoning" delta) of
             (Just (String txt), _) -> [object ["text" .= txt]]
             (_, Just (String txt)) -> [object ["text" .= txt]]
             _ -> []
+          -- Extract tool calls and convert to Gemini functionCall format
+          toolCallParts = case HM.lookup "tool_calls" delta of
+            Just (Array toolCalls) -> V.toList $ V.map convertToolCall toolCalls
+            _ -> []
+          parts = textParts ++ toolCallParts
       in object $
           [ "content" .= object
               [ "parts" .= parts
@@ -1090,6 +1269,27 @@ openAIChunkToGemini openAIChunk =
                   Just r -> ["finishReason" .= r]
                   Nothing -> [])
     convertChoice _ = object []
+
+    -- Convert OpenAI tool_call to Gemini functionCall part
+    convertToolCall (Object tc) =
+      let tcId = HM.lookup "id" tc
+          tcFunc = case HM.lookup "function" tc of
+            Just (Object f) -> f
+            _ -> HM.empty
+          funcName = HM.lookup "name" tcFunc
+          funcArgs = HM.lookup "arguments" tcFunc
+      in object $
+          [ "functionCall" .= object
+              ([ "name" .= fname | Just fname <- [funcName] ] ++
+               [ "args" .= parseArgs args | Just args <- [funcArgs] ])
+          ] ++ [ "id" .= tid | Just tid <- [tcId] ]
+    convertToolCall _ = object []
+
+    -- Parse function arguments string to JSON object
+    parseArgs (String argsStr) = case eitherDecode (BL.fromStrict $ TE.encodeUtf8 argsStr) of
+      Right val -> val
+      Left _ -> object []
+    parseArgs other = other
 
 -- | Convert OpenAI non-streaming response to Gemini format
 openAIResponseToGemini :: Value -> Value
