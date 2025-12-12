@@ -18,19 +18,11 @@ library
       Louter.Client.OpenAI
       Louter.Client.Gemini
       Louter.Client.Anthropic
-      -- Core protocol conversion
-      Louter.Protocol
-      Louter.Protocol.OpenAI
-      Louter.Protocol.Gemini
-      Louter.Protocol.Anthropic
+      -- Core protocol conversion (server-side converters, reused by client)
       Louter.Protocol.AnthropicConverter
       Louter.Protocol.AnthropicStreaming
       Louter.Protocol.GeminiConverter
       Louter.Protocol.GeminiStreaming
-      -- Streaming infrastructure
-      Louter.Streaming.Parser
-      Louter.Streaming.Processor
-      Louter.Streaming.Classifier
       -- Types
       Louter.Types
       Louter.Types.Request
@@ -97,10 +89,6 @@ test-suite louter-test
   type: exitcode-stdio-1.0
   main-is: Spec.hs
   other-modules:
-      ParserSpec
-      ClassifierSpec
-      ProcessorSpec
-      ProtocolSpec
   hs-source-dirs: test
   default-language: Haskell2010
   ghc-options: -Wall -threaded -rtsopts -with-rtsopts=-N
