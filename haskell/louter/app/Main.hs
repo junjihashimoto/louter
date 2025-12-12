@@ -5,9 +5,10 @@
 -- Routes requests between different LLM protocols using raw WAI
 module Main where
 
-import Control.Monad (foldM)
+import Control.Applicative ((<|>))
+import Control.Monad (foldM, forM_, unless, when)
 import Control.Monad.IO.Class (liftIO)
-import Data.Aeson (Value(..), encode, eitherDecode, object, (.=))
+import Data.Aeson (Value(..), Object, encode, eitherDecode, object, (.=))
 import qualified Data.Aeson.KeyMap as HM
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
@@ -15,8 +16,11 @@ import qualified Data.ByteString.Char8 as BS8
 import Data.ByteString.Builder (Builder, byteString)
 import Data.Conduit ((.|), runConduit, await)
 import qualified Data.Conduit.List as CL
+import qualified Data.HashMap.Strict as HMS
+import Data.List (sortBy)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Ord (comparing)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -592,6 +596,9 @@ anthropicToOpenAI (Object obj) = do
     Just (Array msgs) -> Right $ V.toList msgs
     _ -> Left "Missing 'messages' field"
 
+  -- Convert messages to OpenAI format
+  let convertedMessages = map convertAnthropicMessageToOpenAI messages
+
   -- Extract max_tokens
   let maxTokens = case HM.lookup "max_tokens" obj of
         Just (Number n) -> Just (floor n :: Int)
@@ -611,22 +618,163 @@ anthropicToOpenAI (Object obj) = do
         Just (String sys) -> [object ["role" .= ("system" :: Text), "content" .= sys]]
         _ -> []
 
-  -- Extract tools if present
+  -- Extract tools if present and convert to OpenAI format
   let tools = case HM.lookup "tools" obj of
-        Just (Array ts) -> Just (Array ts)
+        Just (Array ts) -> Just (convertAnthropicToolsToOpenAI (V.toList ts))
         _ -> Nothing
+
+  -- Extract stream flag (default to False for Anthropic)
+  let streamFlag = case HM.lookup "stream" obj of
+        Just (Bool b) -> b
+        _ -> False
 
   Right $ object $
     [ "model" .= model
-    , "messages" .= (systemMsg ++ messages)
+    , "messages" .= (systemMsg ++ convertedMessages)
     , "max_tokens" .= maxTokens
     , "temperature" .= temperature
-    , "stream" .= True
+    , "stream" .= streamFlag
     ] ++ case tools of
           Just t -> ["tools" .= t]
           Nothing -> []
 
 anthropicToOpenAI _ = Left "Request must be a JSON object"
+
+-- | Convert Anthropic message to OpenAI format
+convertAnthropicMessageToOpenAI :: Value -> Value
+convertAnthropicMessageToOpenAI (Object msg) =
+  let role = case HM.lookup "role" msg of
+        Just (String r) -> r
+        _ -> "user"
+
+      content = case HM.lookup "content" msg of
+        Just c -> c
+        _ -> String ""
+
+  in case content of
+    -- Simple text content
+    String text -> object ["role" .= role, "content" .= text]
+
+    -- Array of content blocks (may include tool_result, tool_use, or text)
+    Array blocks ->
+      let contentBlocks = V.toList blocks
+          hasToolResult = any isAnthropicToolResult contentBlocks
+          hasToolUse = any isAnthropicToolUse contentBlocks
+      in
+        if hasToolResult
+          then convertAnthropicToolResultToOpenAI contentBlocks
+        else if hasToolUse
+          then convertAnthropicToolUseToOpenAI role contentBlocks
+        else
+          -- Regular text blocks
+          let textContent = T.concat [txt | Object block <- contentBlocks,
+                                            Just (String txt) <- [HM.lookup "text" block]]
+          in object ["role" .= role, "content" .= textContent]
+
+    _ -> object ["role" .= role, "content" .= content]
+
+convertAnthropicMessageToOpenAI other = other
+
+-- | Check if content block is a tool_result
+isAnthropicToolResult :: Value -> Bool
+isAnthropicToolResult (Object block) =
+  case HM.lookup "type" block of
+    Just (String "tool_result") -> True
+    _ -> False
+isAnthropicToolResult _ = False
+
+-- | Check if content block is a tool_use
+isAnthropicToolUse :: Value -> Bool
+isAnthropicToolUse (Object block) =
+  case HM.lookup "type" block of
+    Just (String "tool_use") -> True
+    _ -> False
+isAnthropicToolUse _ = False
+
+-- | Convert Anthropic tool_result to OpenAI tool message
+convertAnthropicToolResultToOpenAI :: [Value] -> Value
+convertAnthropicToolResultToOpenAI blocks =
+  case [block | block@(Object b) <- blocks, isAnthropicToolResult block] of
+    (Object toolResult:_) ->
+      let toolUseId = case HM.lookup "tool_use_id" toolResult of
+            Just (String tid) -> tid
+            _ -> "unknown"
+          resultContent = case HM.lookup "content" toolResult of
+            Just (String c) -> c
+            Just other -> TE.decodeUtf8 (BL.toStrict $ encode other)
+            _ -> ""
+      in object
+          [ "role" .= ("tool" :: Text)
+          , "content" .= resultContent
+          , "tool_call_id" .= toolUseId
+          ]
+    _ -> object ["role" .= ("tool" :: Text), "content" .= ("" :: Text)]
+
+-- | Convert Anthropic tool_use to OpenAI assistant message with tool_calls
+convertAnthropicToolUseToOpenAI :: Text -> [Value] -> Value
+convertAnthropicToolUseToOpenAI role blocks =
+  let textParts = [txt | Object block <- blocks,
+                         HM.lookup "type" block == Just (String "text"),
+                         Just (String txt) <- [HM.lookup "text" block]]
+      textContent = if null textParts then Nothing else Just (T.concat textParts)
+
+      toolCalls = [convertToolUseBlock block | block@(Object _) <- blocks, isAnthropicToolUse block]
+
+  in object $
+      [ "role" .= role ] ++
+      [ "content" .= tc | Just tc <- [textContent] ] ++
+      [ "tool_calls" .= toolCalls | not (null toolCalls) ]
+  where
+    convertToolUseBlock (Object block) =
+      let toolId = case HM.lookup "id" block of
+            Just (String tid) -> tid
+            _ -> "call_unknown"
+          toolName = case HM.lookup "name" block of
+            Just (String n) -> n
+            _ -> "unknown"
+          toolInput = case HM.lookup "input" block of
+            Just inp -> encode inp
+            _ -> "{}"
+      in object
+          [ "id" .= toolId
+          , "type" .= ("function" :: Text)
+          , "function" .= object
+              [ "name" .= toolName
+              , "arguments" .= TE.decodeUtf8 (BL.toStrict toolInput)
+              ]
+          ]
+    convertToolUseBlock _ = object []
+
+-- | Convert Anthropic tools to OpenAI format
+convertAnthropicToolsToOpenAI :: [Value] -> [Value]
+convertAnthropicToolsToOpenAI = map convertTool
+  where
+    convertTool (Object tool) =
+      let name = HM.lookup "name" tool
+          description = HM.lookup "description" tool
+          inputSchema = HM.lookup "input_schema" tool
+      in object
+          [ "type" .= ("function" :: Text)
+          , "function" .= object
+              ([ "name" .= n | Just n <- [name] ] ++
+               [ "description" .= d | Just d <- [description] ] ++
+               [ "parameters" .= s | Just s <- [inputSchema] ])
+          ]
+    convertTool other = other
+
+-- | Tool call state for Anthropic streaming (same as Gemini)
+data AnthropicToolCallState = AnthropicToolCallState
+  { anthropicToolCallId :: Maybe Text
+  , anthropicToolCallName :: Maybe Text
+  , anthropicToolCallArgs :: Text  -- Accumulated arguments string
+  } deriving (Show)
+
+-- | Anthropic streaming state
+data AnthropicStreamState = AnthropicStreamState
+  { anthropicToolCalls :: HMS.HashMap Int AnthropicToolCallState
+  , anthropicContentBlockStarted :: Bool
+  , anthropicCurrentIndex :: Int
+  } deriving (Show)
 
 -- | Convert OpenAI SSE stream to Anthropic SSE format
 convertOpenAIToAnthropic :: (Builder -> IO ()) -> IO () -> HTTP.BodyReader -> IO ()
@@ -635,121 +783,303 @@ convertOpenAIToAnthropic write flush bodyReader = do
   write (byteString $ BS8.pack "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-haiku-20240307\",\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n")
   flush
 
-  -- Send content_block_start
-  write (byteString $ BS8.pack "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n")
-  flush
+  -- Stream with stateful tool call tracking
+  let initialState = AnthropicStreamState HMS.empty False 0
+  streamAnthropicDeltas write flush bodyReader initialState
 
-  -- Stream content deltas
-  streamContentDeltas write flush bodyReader 0
-
-  -- Send content_block_stop
-  write (byteString $ BS8.pack "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n")
-  flush
-
-  -- Send message_delta with stop_reason
-  write (byteString $ BS8.pack "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":10}}\n\n")
-  flush
-
-  -- Send message_stop
-  write (byteString $ BS8.pack "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
-  flush
-
--- | Stream content deltas from OpenAI response
-streamContentDeltas :: (Builder -> IO ()) -> IO () -> HTTP.BodyReader -> Int -> IO ()
-streamContentDeltas write flush bodyReader contentIndex = loop BS.empty
+-- | Stream Anthropic deltas with tool call state management
+streamAnthropicDeltas :: (Builder -> IO ()) -> IO () -> HTTP.BodyReader -> AnthropicStreamState -> IO ()
+streamAnthropicDeltas write flush bodyReader initialState = loop BS.empty initialState
   where
-    loop acc = do
+    loop acc state = do
       chunk <- brRead bodyReader
       if BS.null chunk
-        then pure ()
+        then finalize state
         else do
           let combined = acc <> chunk
               lines' = BS.split (fromIntegral $ fromEnum '\n') combined
           case lines' of
-            [] -> loop BS.empty
-            [incomplete] -> loop incomplete
+            [] -> loop BS.empty state
+            [incomplete] -> loop incomplete state
             _ -> do
               let (completeLines, rest) = (init lines', last lines')
-              mapM_ (processOpenAILine write flush contentIndex) completeLines
-              loop rest
+              newState <- foldM (processOpenAILineToAnthropicStateful write flush) state completeLines
+              loop rest newState
 
--- | Process a single OpenAI SSE line and convert to Anthropic format
-processOpenAILine :: (Builder -> IO ()) -> IO () -> Int -> BS.ByteString -> IO ()
-processOpenAILine write flush contentIndex line
+    finalize state = do
+      -- Close any open content blocks
+      when (anthropicContentBlockStarted state) $ do
+        write (byteString $ BS8.pack $ "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":" ++ show (anthropicCurrentIndex state) ++ "}\n\n")
+        flush
+
+      -- Send message_delta with stop_reason
+      write (byteString $ BS8.pack "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":10}}\n\n")
+      flush
+
+      -- Send message_stop
+      write (byteString $ BS8.pack "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+      flush
+
+-- | Process a single OpenAI SSE line and convert to Anthropic format (stateful)
+processOpenAILineToAnthropicStateful :: (Builder -> IO ()) -> IO () -> AnthropicStreamState -> BS.ByteString -> IO AnthropicStreamState
+processOpenAILineToAnthropicStateful write flush state line
   | BS.isPrefixOf "data: " line = do
       let jsonText = TE.decodeUtf8 $ BS.drop 6 line
       if jsonText == "[DONE]"
-        then pure ()  -- Don't send [DONE] in Anthropic format
+        then pure state  -- Don't send [DONE] in Anthropic format
         else case eitherDecode (BL.fromStrict $ TE.encodeUtf8 jsonText) of
           Right (Object openAIChunk) -> do
-            -- Extract content delta
+            -- Extract choices
             case HM.lookup "choices" openAIChunk of
               Just (Array choices) | not (V.null choices) -> do
                 case V.head choices of
-                  Object choice -> do
-                    case HM.lookup "delta" choice of
-                      Just (Object delta) -> do
-                        -- Check for content
-                        case HM.lookup "content" delta of
-                          Just (String content) -> do
-                            let anthropicEvent = object
-                                  [ "type" .= ("content_block_delta" :: Text)
-                                  , "index" .= contentIndex
-                                  , "delta" .= object
-                                      [ "type" .= ("text_delta" :: Text)
-                                      , "text" .= content
-                                      ]
-                                  ]
-                            write (byteString $ BS8.pack "event: content_block_delta\ndata: " <> BL.toStrict (encode anthropicEvent) <> BS8.pack "\n\n")
-                            flush
-                          _ -> pure ()
+                  Object choice -> processAnthropicChoice write flush state choice openAIChunk
+                  _ -> pure state
+              _ -> pure state
+          _ -> pure state
+  | otherwise = pure state
 
-                        -- Check for reasoning (treat as content for now)
-                        case HM.lookup "reasoning" delta of
-                          Just (String reasoning) -> do
-                            let anthropicEvent = object
-                                  [ "type" .= ("content_block_delta" :: Text)
-                                  , "index" .= contentIndex
-                                  , "delta" .= object
-                                      [ "type" .= ("text_delta" :: Text)
-                                      , "text" .= reasoning
-                                      ]
-                                  ]
-                            write (byteString $ BS8.pack "event: content_block_delta\ndata: " <> BL.toStrict (encode anthropicEvent) <> BS8.pack "\n\n")
-                            flush
-                          _ -> pure ()
-                      _ -> pure ()
-                  _ -> pure ()
-              _ -> pure ()
-          _ -> pure ()
-  | otherwise = pure ()
+-- | Process a single choice and update Anthropic state
+processAnthropicChoice :: (Builder -> IO ()) -> IO () -> AnthropicStreamState -> Object -> Object -> IO AnthropicStreamState
+processAnthropicChoice write flush state choice openAIChunk = do
+  let finishReason = case HM.lookup "finish_reason" choice of
+        Just (String reason) -> Just reason
+        _ -> Nothing
+
+  case HM.lookup "delta" choice of
+    Just (Object delta) -> do
+      -- Check for text content
+      let hasContent = HM.member "content" delta
+      let hasToolCalls = HM.member "tool_calls" delta
+
+      newState <- if hasContent
+        then do
+          -- Start text content block if not started
+          unless (anthropicContentBlockStarted state) $ do
+            let idx = anthropicCurrentIndex state
+            let startEvent = object
+                  [ "type" .= ("content_block_start" :: Text)
+                  , "index" .= idx
+                  , "content_block" .= object
+                      [ "type" .= ("text" :: Text)
+                      , "text" .= ("" :: Text)
+                      ]
+                  ]
+            write (byteString $ BS8.pack "event: content_block_start\ndata: " <> BL.toStrict (encode startEvent) <> BS8.pack "\n\n")
+            flush
+
+          -- Send content delta
+          case HM.lookup "content" delta of
+            Just (String content) -> do
+              let idx = anthropicCurrentIndex state
+              let deltaEvent = object
+                    [ "type" .= ("content_block_delta" :: Text)
+                    , "index" .= idx
+                    , "delta" .= object
+                        [ "type" .= ("text_delta" :: Text)
+                        , "text" .= content
+                        ]
+                    ]
+              write (byteString $ BS8.pack "event: content_block_delta\ndata: " <> BL.toStrict (encode deltaEvent) <> BS8.pack "\n\n")
+              flush
+            _ -> pure ()
+
+          pure $ state { anthropicContentBlockStarted = True }
+
+        else if hasToolCalls
+          then processAnthropicToolCalls write flush state delta finishReason
+          else pure state
+
+      -- Handle finish_reason
+      finalState <- case finishReason of
+        Just "tool_calls" ->
+          -- Emit buffered tool calls
+          emitAnthropicToolCalls write flush newState
+
+        Just _ ->
+          -- Close text content block if open
+          if anthropicContentBlockStarted newState
+            then do
+              let idx = anthropicCurrentIndex newState
+              write (byteString $ BS8.pack $ "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":" ++ show idx ++ "}\n\n")
+              flush
+              pure newState { anthropicContentBlockStarted = False }
+            else pure newState
+
+        Nothing -> pure newState
+
+      pure finalState
+
+    _ -> pure state
+
+-- | Process tool calls delta and buffer them
+processAnthropicToolCalls :: (Builder -> IO ()) -> IO () -> AnthropicStreamState -> Object -> Maybe Text -> IO AnthropicStreamState
+processAnthropicToolCalls write flush state delta finishReason = do
+  case HM.lookup "tool_calls" delta of
+    Just (Array toolCallsArray) -> do
+      foldM (processAnthropicSingleToolCall write flush) state (V.toList toolCallsArray)
+    _ -> pure state
+
+-- | Process a single tool call fragment
+processAnthropicSingleToolCall :: (Builder -> IO ()) -> IO () -> AnthropicStreamState -> Value -> IO AnthropicStreamState
+processAnthropicSingleToolCall write flush state (Object tcDelta) = do
+  let tcIndex = case HM.lookup "index" tcDelta of
+        Just (Number n) -> floor n :: Int
+        _ -> 0
+
+  let tcId = case HM.lookup "id" tcDelta of
+        Just (String i) -> Just i
+        _ -> Nothing
+
+  let tcFunc = HM.lookup "function" tcDelta
+
+  let tcName = case tcFunc of
+        Just (Object f) -> case HM.lookup "name" f of
+          Just (String n) -> Just n
+          _ -> Nothing
+        _ -> Nothing
+
+  let tcArgs = case tcFunc of
+        Just (Object f) -> case HM.lookup "arguments" f of
+          Just (String a) -> a
+          _ -> ""
+        _ -> ""
+
+  -- Update state
+  let currentTc = HMS.lookupDefault (AnthropicToolCallState Nothing Nothing "") tcIndex (anthropicToolCalls state)
+  let updatedTc = AnthropicToolCallState
+        { anthropicToolCallId = tcId <|> anthropicToolCallId currentTc
+        , anthropicToolCallName = tcName <|> anthropicToolCallName currentTc
+        , anthropicToolCallArgs = anthropicToolCallArgs currentTc <> tcArgs
+        }
+  let newToolCalls = HMS.insert tcIndex updatedTc (anthropicToolCalls state)
+
+  pure $ state { anthropicToolCalls = newToolCalls }
+
+processAnthropicSingleToolCall _ _ state _ = pure state
+
+-- | Emit buffered tool calls as Anthropic tool_use blocks
+emitAnthropicToolCalls :: (Builder -> IO ()) -> IO () -> AnthropicStreamState -> IO AnthropicStreamState
+emitAnthropicToolCalls write flush state = do
+  let toolCallsList = HMS.toList (anthropicToolCalls state)
+  let sortedToolCalls = sortBy (comparing fst) toolCallsList
+
+  forM_ sortedToolCalls $ \(tcIndex, tcState) -> do
+    case (anthropicToolCallId tcState, anthropicToolCallName tcState) of
+      (Just toolId, Just toolName) -> do
+        -- Parse arguments as JSON
+        let argsJson = case eitherDecode (BL.fromStrict $ TE.encodeUtf8 (anthropicToolCallArgs tcState)) of
+              Right val -> val
+              Left _ -> object []
+
+        -- Calculate content block index (after text blocks)
+        let blockIndex = anthropicCurrentIndex state + tcIndex
+
+        -- Send content_block_start
+        let startEvent = object
+              [ "type" .= ("content_block_start" :: Text)
+              , "index" .= blockIndex
+              , "content_block" .= object
+                  [ "type" .= ("tool_use" :: Text)
+                  , "id" .= toolId
+                  , "name" .= toolName
+                  ]
+              ]
+        write (byteString $ BS8.pack "event: content_block_start\ndata: " <> BL.toStrict (encode startEvent) <> BS8.pack "\n\n")
+        flush
+
+        -- Send input_json_delta
+        let deltaEvent = object
+              [ "type" .= ("content_block_delta" :: Text)
+              , "index" .= blockIndex
+              , "delta" .= object
+                  [ "type" .= ("input_json_delta" :: Text)
+                  , "partial_json" .= TE.decodeUtf8 (BL.toStrict $ encode argsJson)
+                  ]
+              ]
+        write (byteString $ BS8.pack "event: content_block_delta\ndata: " <> BL.toStrict (encode deltaEvent) <> BS8.pack "\n\n")
+        flush
+
+        -- Send content_block_stop
+        let stopEvent = object
+              [ "type" .= ("content_block_stop" :: Text)
+              , "index" .= blockIndex
+              ]
+        write (byteString $ BS8.pack "event: content_block_stop\ndata: " <> BL.toStrict (encode stopEvent) <> BS8.pack "\n\n")
+        flush
+
+      _ -> pure ()
+
+  pure $ state { anthropicCurrentIndex = anthropicCurrentIndex state + length sortedToolCalls }
 
 -- | Convert OpenAI non-streaming response to Anthropic format
 openAIResponseToAnthropic :: Value -> Value
 openAIResponseToAnthropic (Object openAIResp) =
-  let content = case HM.lookup "choices" openAIResp of
+  let (content, stopReason) = case HM.lookup "choices" openAIResp of
         Just (Array choices) | not (V.null choices) ->
           case V.head choices of
-            Object choice -> case HM.lookup "message" choice of
-              Just (Object msg) -> case HM.lookup "content" msg of
-                Just (String txt) -> [object ["type" .= ("text" :: Text), "text" .= txt]]
-                _ -> []
-              _ -> []
-            _ -> []
-        _ -> []
+            Object choice ->
+              let finishReason = case HM.lookup "finish_reason" choice of
+                    Just (String "tool_calls") -> "tool_use"
+                    Just (String "stop") -> "end_turn"
+                    Just (String "length") -> "max_tokens"
+                    _ -> "end_turn"
+              in case HM.lookup "message" choice of
+                Just (Object msg) ->
+                  let textContent = case HM.lookup "content" msg of
+                        Just (String txt) | not (T.null txt) ->
+                          [object ["type" .= ("text" :: Text), "text" .= txt]]
+                        _ -> []
+
+                      toolContent = case HM.lookup "tool_calls" msg of
+                        Just (Array tcs) -> map convertOpenAIToolCallToAnthropic (V.toList tcs)
+                        _ -> []
+
+                      allContent = textContent ++ toolContent
+                  in (allContent, finishReason)
+                _ -> ([], "end_turn")
+            _ -> ([], "end_turn")
+        _ -> ([], "end_turn")
   in object
       [ "id" .= ("msg_1" :: Text)
       , "type" .= ("message" :: Text)
       , "role" .= ("assistant" :: Text)
       , "content" .= content
       , "model" .= ("claude-3-haiku-20240307" :: Text)
-      , "stop_reason" .= ("end_turn" :: Text)
+      , "stop_reason" .= (stopReason :: Text)
       , "usage" .= object
           [ "input_tokens" .= (10 :: Int)
           , "output_tokens" .= (10 :: Int)
           ]
       ]
 openAIResponseToAnthropic _ = object []
+
+-- | Convert OpenAI tool_call to Anthropic tool_use content block
+convertOpenAIToolCallToAnthropic :: Value -> Value
+convertOpenAIToolCallToAnthropic (Object tc) =
+  let toolId = case HM.lookup "id" tc of
+        Just (String tid) -> tid
+        _ -> "tool_unknown"
+
+      (toolName, toolArgs) = case HM.lookup "function" tc of
+        Just (Object func) ->
+          let name = case HM.lookup "name" func of
+                Just (String n) -> n
+                _ -> "unknown"
+              args = case HM.lookup "arguments" func of
+                Just (String a) -> case eitherDecode (BL.fromStrict $ TE.encodeUtf8 a) of
+                  Right val -> val
+                  Left _ -> object []
+                _ -> object []
+          in (name, args)
+        _ -> ("unknown", object [])
+  in object
+      [ "type" .= ("tool_use" :: Text)
+      , "id" .= toolId
+      , "name" .= toolName
+      , "input" .= toolArgs
+      ]
+convertOpenAIToolCallToAnthropic _ = object []
 
 -- ==============================================================================
 -- Gemini API Handlers
