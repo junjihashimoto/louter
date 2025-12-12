@@ -50,7 +50,8 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Network.HTTP.Client
 import Network.HTTP.Client.TLS (tlsManagerSettings)
-import Network.HTTP.Types (hContentType, hAuthorization, RequestHeaders)
+import Network.HTTP.Types (hContentType, hAuthorization)
+import Network.HTTP.Types.Header (RequestHeaders)
 
 -- Import server-side converters (proven, tested code)
 import Louter.Protocol.AnthropicConverter

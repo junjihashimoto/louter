@@ -60,13 +60,21 @@ data AppState = AppState
   , appManager :: Manager           -- HTTP client manager for direct proxying
   }
 
+-- | Backend type enumeration
+data BackendType
+  = BackendTypeOpenAI    -- OpenAI-compatible (including llama-server)
+  | BackendTypeAnthropic -- Anthropic Claude API
+  | BackendTypeGemini    -- Google Gemini API
+  deriving (Show, Eq)
+
 -- | Simplified config (will expand later)
 data Config = Config
   { configBackends :: Map Text BackendConfig
   } deriving (Show)
 
 data BackendConfig = BackendConfig
-  { backendUrl :: Text
+  { backendType :: BackendType
+  , backendUrl :: Text
   , backendApiKey :: Maybe Text
   , backendRequiresAuth :: Bool
   , backendModelMapping :: Map Text Text  -- frontend model -> backend model
@@ -99,7 +107,8 @@ main = do
   let defaultConfig = Config
         { configBackends = Map.fromList
             [("llama", BackendConfig
-                { backendUrl = "http://localhost:11211"
+                { backendType = BackendTypeOpenAI
+                , backendUrl = "http://localhost:11211"
                 , backendApiKey = Nothing
                 , backendRequiresAuth = False
                 , backendModelMapping = Map.empty
@@ -235,6 +244,7 @@ healthHandler _state _req respond =
       ])
 
 -- | /v1/chat/completions - OpenAI endpoint
+-- Routes to appropriate backend based on configuration
 openAIChatHandler :: AppState -> Application
 openAIChatHandler state req respond = do
   -- Read request body
@@ -246,114 +256,76 @@ openAIChatHandler state req respond = do
       (encode $ object ["error" .= ("Invalid request: " <> T.pack err :: Text)])
 
     Right openAIReq -> do
-      -- For now, just use the first available client (llama)
-      case Map.lookup "llama" (appClients state) of
-        Nothing -> respond $ responseLBS status500
+      -- Get first backend (for now - TODO: support backend selection via model name)
+      case Map.toList (configBackends $ appConfig state) of
+        [] -> respond $ responseLBS status500
           [("Content-Type", "application/json")]
           (encode $ object ["error" .= ("No backend configured" :: Text)])
 
-        Just client -> do
+        ((backendName, backendCfg):_) -> do
           -- Check if streaming is requested
           let isStreaming = getStreamFlag openAIReq
 
-          if isStreaming
-            then handleStreamingRequest state openAIReq respond
-            else handleNonStreamingRequest state openAIReq respond
+          -- Route based on backend type
+          case backendType backendCfg of
+            BackendTypeOpenAI ->
+              -- Direct OpenAI-compatible backend (no conversion needed)
+              if isStreaming
+                then handleOpenAIStreamingToOpenAI state backendCfg openAIReq respond
+                else handleOpenAINonStreamingToOpenAI state backendCfg openAIReq respond
 
--- | Handle non-streaming OpenAI request
-handleNonStreamingRequest :: AppState -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
-handleNonStreamingRequest state openAIReq respond = do
-  -- Parse OpenAI request
-  case parseOpenAIRequest openAIReq of
-    Left err -> respond $ responseLBS status400
-      [("Content-Type", "application/json")]
-      (encode $ object ["error" .= err])
+            BackendTypeAnthropic ->
+              -- OpenAI frontend → Anthropic backend (needs conversion)
+              if isStreaming
+                then handleOpenAIStreamingToAnthropic state backendCfg openAIReq respond
+                else handleOpenAINonStreamingToAnthropic state backendCfg openAIReq respond
 
-    Right chatReq -> nonStreamingResponse state chatReq respond
+            BackendTypeGemini ->
+              -- OpenAI frontend → Gemini backend (needs conversion)
+              if isStreaming
+                then handleOpenAIStreamingToGemini state backendCfg openAIReq respond
+                else handleOpenAINonStreamingToGemini state backendCfg openAIReq respond
 
--- | Non-streaming response from backend
-nonStreamingResponse :: AppState -> ChatRequest -> (Response -> IO ResponseReceived) -> IO ResponseReceived
-nonStreamingResponse state chatReq respond = do
-  -- Get backend URL from config
-  let backendUrl = "http://localhost:11211/v1/chat/completions"  -- TODO: Get from config
-      -- Convert messages to proper JSON format
-      messagesJson = map (\msg -> object
-        [ "role" .= msgRole msg
-        , "content" .= msgContent msg
-        ]) (reqMessages chatReq)
-      requestBody' = encode $ object
-        [ "model" .= reqModel chatReq
-        , "messages" .= messagesJson
-        , "tools" .= if null (reqTools chatReq) then Nothing else Just (reqTools chatReq)
-        , "temperature" .= reqTemperature chatReq
-        , "max_tokens" .= reqMaxTokens chatReq
-        , "stream" .= False  -- Non-streaming
-        ]
+-- ==============================================================================
+-- OpenAI Frontend → OpenAI Backend (Direct, No Conversion)
+-- ==============================================================================
 
-  -- Create backend request
-  req <- HTTP.parseRequest ("POST " <> backendUrl)
+-- | OpenAI → OpenAI non-streaming
+handleOpenAINonStreamingToOpenAI :: AppState -> BackendConfig -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
+handleOpenAINonStreamingToOpenAI state backendCfg openAIReq respond = do
+  let url = T.unpack $ backendUrl backendCfg <> "/v1/chat/completions"
+
+  -- Create backend request (pass-through, no conversion)
+  req <- HTTP.parseRequest ("POST " <> url)
   let req' = req
-        { HTTP.requestBody = HTTP.RequestBodyLBS requestBody'
+        { HTTP.requestBody = HTTP.RequestBodyLBS (encode openAIReq)
         , HTTP.requestHeaders = [("Content-Type", "application/json")]
         }
 
   -- Make synchronous request
   response <- HTTP.httpLbs req' (appManager state)
-  let responseBody' = HTTP.responseBody response
-      status' = HTTP.responseStatus response
-
-  -- Return the response as-is
-  respond $ responseLBS status'
+  respond $ responseLBS (HTTP.responseStatus response)
     [("Content-Type", "application/json")]
-    responseBody'
+    (HTTP.responseBody response)
 
--- | Handle streaming OpenAI request
-handleStreamingRequest :: AppState -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
-handleStreamingRequest state openAIReq respond = do
-  -- Parse OpenAI request
-  case parseOpenAIRequest openAIReq of
-    Left err -> respond $ responseLBS status400
-      [("Content-Type", "application/json")]
-      (encode $ object ["error" .= err])
+-- | OpenAI → OpenAI streaming
+handleOpenAIStreamingToOpenAI :: AppState -> BackendConfig -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
+handleOpenAIStreamingToOpenAI state backendCfg openAIReq respond = do
+  let url = T.unpack $ backendUrl backendCfg <> "/v1/chat/completions"
 
-    Right chatReq -> streamResponse state chatReq respond
-
--- | Stream response from backend by directly proxying HTTP stream
-streamResponse :: AppState -> ChatRequest -> (Response -> IO ResponseReceived) -> IO ResponseReceived
-streamResponse state chatReq respond = do
-  -- Get backend URL from config
-  let backendUrl = "http://localhost:11211/v1/chat/completions"  -- TODO: Get from config
-      -- Convert messages to proper JSON format
-      messagesJson = map (\msg -> object
-        [ "role" .= msgRole msg
-        , "content" .= msgContent msg
-        ]) (reqMessages chatReq)
-      requestBody' = encode $ object
-        [ "model" .= reqModel chatReq
-        , "messages" .= messagesJson
-        , "tools" .= if null (reqTools chatReq) then Nothing else Just (reqTools chatReq)
-        , "temperature" .= reqTemperature chatReq
-        , "max_tokens" .= reqMaxTokens chatReq
-        , "stream" .= True
-        ]
-
-  -- Create backend request
-  req <- HTTP.parseRequest ("POST " <> backendUrl)  -- Explicitly set POST method
+  req <- HTTP.parseRequest ("POST " <> url)
   let req' = req
-        { HTTP.requestBody = HTTP.RequestBodyLBS requestBody'
+        { HTTP.requestBody = HTTP.RequestBodyLBS (encode openAIReq)
         , HTTP.requestHeaders = [("Content-Type", "application/json")]
         }
 
-  -- Create SSE response that directly streams from backend
   let sseResponse = responseStream status200
         [ ("Content-Type", "text/event-stream")
         , ("Cache-Control", "no-cache")
         , ("Connection", "keep-alive")
         ] $ \write flush -> do
-          -- Make request with streaming response handler
           withResponse req' (appManager state) $ \backendResp -> do
             let body = HTTP.responseBody backendResp
-            -- Stream chunks directly from backend
             let loop = do
                   chunk <- brRead body
                   if BS.null chunk
@@ -365,6 +337,332 @@ streamResponse state chatReq respond = do
             loop
 
   respond sseResponse
+
+-- ==============================================================================
+-- OpenAI Frontend → Anthropic Backend (Requires Conversion)
+-- ==============================================================================
+
+-- | OpenAI → Anthropic non-streaming
+handleOpenAINonStreamingToAnthropic :: AppState -> BackendConfig -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
+handleOpenAINonStreamingToAnthropic state backendCfg openAIReq respond = do
+  -- Convert OpenAI request to Anthropic format (reverse of anthropicToOpenAI)
+  case openAIToAnthropic openAIReq of
+    Left err -> respond $ responseLBS status400
+      [("Content-Type", "application/json")]
+      (encode $ object ["error" .= err])
+
+    Right anthropicReq -> do
+      let url = T.unpack $ backendUrl backendCfg <> "/v1/messages"
+
+      req <- HTTP.parseRequest ("POST " <> url)
+      let req' = req
+            { HTTP.requestBody = HTTP.RequestBodyLBS (encode anthropicReq)
+            , HTTP.requestHeaders = [("Content-Type", "application/json")]
+            }
+
+      response <- HTTP.httpLbs req' (appManager state)
+
+      -- Convert Anthropic response back to OpenAI format
+      case eitherDecode (HTTP.responseBody response) of
+        Left err -> respond $ responseLBS status500
+          [("Content-Type", "application/json")]
+          (encode $ object ["error" .= ("Failed to parse Anthropic response: " <> T.pack err :: Text)])
+
+        Right anthropicResp -> do
+          let openAIResp = anthropicToOpenAIResponse anthropicResp
+          respond $ responseLBS status200
+            [("Content-Type", "application/json")]
+            (encode openAIResp)
+
+-- | OpenAI → Anthropic streaming
+handleOpenAIStreamingToAnthropic :: AppState -> BackendConfig -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
+handleOpenAIStreamingToAnthropic state backendCfg openAIReq respond = do
+  case openAIToAnthropic openAIReq of
+    Left err -> respond $ responseLBS status400
+      [("Content-Type", "application/json")]
+      (encode $ object ["error" .= err])
+
+    Right anthropicReq -> do
+      let url = T.unpack $ backendUrl backendCfg <> "/v1/messages"
+
+      req <- HTTP.parseRequest ("POST " <> url)
+      let req' = req
+            { HTTP.requestBody = HTTP.RequestBodyLBS (encode anthropicReq)
+            , HTTP.requestHeaders = [("Content-Type", "application/json")]
+            }
+
+      -- Stream and convert Anthropic SSE → OpenAI SSE
+      let sseResponse = responseStream status200
+            [ ("Content-Type", "text/event-stream")
+            , ("Cache-Control", "no-cache")
+            , ("Connection", "keep-alive")
+            ] $ \write flush -> do
+              withResponse req' (appManager state) $ \backendResp -> do
+                let body = HTTP.responseBody backendResp
+                -- TODO: Convert Anthropic SSE events to OpenAI SSE format
+                -- For now, pass through (will need proper conversion)
+                convertAnthropicToOpenAIStream write flush body
+
+      respond sseResponse
+
+-- ==============================================================================
+-- OpenAI Frontend → Gemini Backend (Requires Conversion)
+-- ==============================================================================
+
+-- | OpenAI → Gemini non-streaming
+handleOpenAINonStreamingToGemini :: AppState -> BackendConfig -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
+handleOpenAINonStreamingToGemini state backendCfg openAIReq respond = do
+  -- Convert OpenAI request to Gemini format (reverse of geminiToOpenAI)
+  case openAIToGemini openAIReq of
+    Left err -> respond $ responseLBS status400
+      [("Content-Type", "application/json")]
+      (encode $ object ["error" .= err])
+
+    Right (modelName, geminiReq) -> do
+      let url = T.unpack $ backendUrl backendCfg <> "/v1beta/models/" <> modelName <> ":generateContent"
+
+      req <- HTTP.parseRequest ("POST " <> url)
+      let req' = req
+            { HTTP.requestBody = HTTP.RequestBodyLBS (encode geminiReq)
+            , HTTP.requestHeaders = [("Content-Type", "application/json")]
+            }
+
+      response <- HTTP.httpLbs req' (appManager state)
+
+      -- Convert Gemini response back to OpenAI format
+      case eitherDecode (HTTP.responseBody response) of
+        Left err -> respond $ responseLBS status500
+          [("Content-Type", "application/json")]
+          (encode $ object ["error" .= ("Failed to parse Gemini response: " <> T.pack err :: Text)])
+
+        Right geminiResp -> do
+          let openAIResp = geminiToOpenAIResponse geminiResp
+          respond $ responseLBS status200
+            [("Content-Type", "application/json")]
+            (encode openAIResp)
+
+-- | OpenAI → Gemini streaming
+handleOpenAIStreamingToGemini :: AppState -> BackendConfig -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
+handleOpenAIStreamingToGemini state backendCfg openAIReq respond = do
+  case openAIToGemini openAIReq of
+    Left err -> respond $ responseLBS status400
+      [("Content-Type", "application/json")]
+      (encode $ object ["error" .= err])
+
+    Right (modelName, geminiReq) -> do
+      let url = T.unpack $ backendUrl backendCfg <> "/v1beta/models/" <> modelName <> ":streamGenerateContent"
+
+      req <- HTTP.parseRequest ("POST " <> url)
+      let req' = req
+            { HTTP.requestBody = HTTP.RequestBodyLBS (encode geminiReq)
+            , HTTP.requestHeaders = [("Content-Type", "application/json")]
+            }
+
+      -- Stream and convert Gemini SSE → OpenAI SSE
+      let sseResponse = responseStream status200
+            [ ("Content-Type", "text/event-stream")
+            , ("Cache-Control", "no-cache")
+            , ("Connection", "keep-alive")
+            ] $ \write flush -> do
+              withResponse req' (appManager state) $ \backendResp -> do
+                let body = HTTP.responseBody backendResp
+                -- TODO: Convert Gemini SSE events to OpenAI SSE format
+                -- For now, pass through (will need proper conversion)
+                convertGeminiToOpenAIStream write flush body
+
+      respond sseResponse
+
+-- ==============================================================================
+-- Conversion Helper Functions (OpenAI ↔ Other Protocols)
+-- ==============================================================================
+
+-- | Convert OpenAI request to Anthropic request format
+openAIToAnthropic :: Value -> Either Text Value
+openAIToAnthropic (Object obj) = do
+  -- Extract required fields from OpenAI format
+  model <- case HM.lookup "model" obj of
+    Just (String m) -> Right m
+    _ -> Left "Missing 'model' field"
+
+  messages <- case HM.lookup "messages" obj of
+    Just (Array msgs) -> Right $ V.toList msgs
+    _ -> Left "Missing 'messages' field"
+
+  -- Convert to Anthropic format (inverse of anthropicToOpenAI)
+  let anthropicMessages = map openAIMessageToAnthropic messages
+      maxTokens = case HM.lookup "max_tokens" obj of
+        Just (Number n) -> Just (floor n :: Int)
+        _ -> Just 1024  -- Default
+
+      temperature = HM.lookup "temperature" obj
+      stream = case HM.lookup "stream" obj of
+        Just (Bool b) -> b
+        _ -> False
+
+  Right $ object $
+    [ "model" .= model
+    , "messages" .= anthropicMessages
+    , "max_tokens" .= maxTokens
+    , "stream" .= stream
+    ] ++ (case temperature of Just t -> ["temperature" .= t]; Nothing -> [])
+
+openAIToAnthropic _ = Left "Request must be a JSON object"
+
+openAIMessageToAnthropic :: Value -> Value
+openAIMessageToAnthropic (Object msg) =
+  let role = case HM.lookup "role" msg of
+        Just (String r) -> r
+        _ -> "user"
+      content = case HM.lookup "content" msg of
+        Just (String c) -> c
+        _ -> ""
+  in object ["role" .= role, "content" .= content]
+openAIMessageToAnthropic other = other
+
+-- | Convert Anthropic response to OpenAI response format
+anthropicToOpenAIResponse :: Value -> Value
+anthropicToOpenAIResponse (Object anthropicResp) =
+  let content = case HM.lookup "content" anthropicResp of
+        Just (Array contentBlocks) | not (V.null contentBlocks) ->
+          case V.head contentBlocks of
+            Object block -> case HM.lookup "text" block of
+              Just (String txt) -> txt
+              _ -> ""
+            _ -> ""
+        _ -> ""
+
+      finishReason :: Text
+      finishReason = case HM.lookup "stop_reason" anthropicResp of
+        Just (String "end_turn") -> "stop"
+        Just (String "max_tokens") -> "length"
+        Just (String "tool_use") -> "tool_calls"
+        _ -> "stop"
+
+  in object
+      [ "id" .= ("chatcmpl-" <> "123" :: Text)
+      , "object" .= ("chat.completion" :: Text)
+      , "created" .= (1234567890 :: Int)
+      , "model" .= ("gpt-4" :: Text)
+      , "choices" .= [object
+          [ "index" .= (0 :: Int)
+          , "message" .= object
+              [ "role" .= ("assistant" :: Text)
+              , "content" .= content
+              ]
+          , "finish_reason" .= finishReason
+          ]]
+      ]
+anthropicToOpenAIResponse _ = object []
+
+-- | Convert Anthropic SSE stream to OpenAI SSE format
+convertAnthropicToOpenAIStream :: (Builder -> IO ()) -> IO () -> HTTP.BodyReader -> IO ()
+convertAnthropicToOpenAIStream write flush bodyReader = do
+  -- TODO: Implement proper Anthropic → OpenAI SSE conversion
+  -- For now, just pass through (will need to parse Anthropic events and convert)
+  let loop = do
+        chunk <- brRead bodyReader
+        if BS.null chunk
+          then pure ()
+          else do
+            -- Simple pass-through for now
+            write (byteString chunk)
+            flush
+            loop
+  loop
+
+-- | Convert OpenAI request to Gemini request format
+openAIToGemini :: Value -> Either Text (Text, Value)
+openAIToGemini (Object obj) = do
+  -- Extract model name
+  model <- case HM.lookup "model" obj of
+    Just (String m) -> Right m
+    _ -> Left "Missing 'model' field"
+
+  messages <- case HM.lookup "messages" obj of
+    Just (Array msgs) -> Right $ V.toList msgs
+    _ -> Left "Missing 'messages' field"
+
+  -- Convert to Gemini format (inverse of geminiToOpenAI)
+  let geminiContents = map openAIMessageToGemini messages
+      temperature = HM.lookup "temperature" obj
+      maxTokens = HM.lookup "max_tokens" obj
+
+      geminiReq = object $
+        [ "contents" .= geminiContents
+        ] ++ (case temperature of
+               Just t -> ["generationConfig" .= object ["temperature" .= t]]
+               Nothing -> [])
+          ++ (case maxTokens of
+               Just m -> ["generationConfig" .= object ["maxOutputTokens" .= m]]
+               Nothing -> [])
+
+  Right (model, geminiReq)
+
+openAIToGemini _ = Left "Request must be a JSON object"
+
+openAIMessageToGemini :: Value -> Value
+openAIMessageToGemini (Object msg) =
+  let role = case HM.lookup "role" msg of
+        Just (String "assistant") -> "model"
+        Just (String r) -> r
+        _ -> "user"
+      content = case HM.lookup "content" msg of
+        Just (String c) -> c
+        _ -> ""
+      parts = [object ["text" .= content]]
+  in object ["role" .= role, "parts" .= parts]
+openAIMessageToGemini other = other
+
+-- | Convert Gemini response to OpenAI response format
+geminiToOpenAIResponse :: Value -> Value
+geminiToOpenAIResponse (Object geminiResp) =
+  let content = case HM.lookup "candidates" geminiResp of
+        Just (Array candidates) | not (V.null candidates) ->
+          case V.head candidates of
+            Object candidate -> case HM.lookup "content" candidate of
+              Just (Object contentObj) -> case HM.lookup "parts" contentObj of
+                Just (Array parts) | not (V.null parts) ->
+                  case V.head parts of
+                    Object part -> case HM.lookup "text" part of
+                      Just (String txt) -> txt
+                      _ -> ""
+                    _ -> ""
+                _ -> ""
+              _ -> ""
+            _ -> ""
+        _ -> ""
+
+  in object
+      [ "id" .= ("chatcmpl-" <> "123" :: Text)
+      , "object" .= ("chat.completion" :: Text)
+      , "created" .= (1234567890 :: Int)
+      , "model" .= ("gpt-4" :: Text)
+      , "choices" .= [object
+          [ "index" .= (0 :: Int)
+          , "message" .= object
+              [ "role" .= ("assistant" :: Text)
+              , "content" .= content
+              ]
+          , "finish_reason" .= ("stop" :: Text)
+          ]]
+      ]
+geminiToOpenAIResponse _ = object []
+
+-- | Convert Gemini SSE stream to OpenAI SSE format
+convertGeminiToOpenAIStream :: (Builder -> IO ()) -> IO () -> HTTP.BodyReader -> IO ()
+convertGeminiToOpenAIStream write flush bodyReader = do
+  -- TODO: Implement proper Gemini → OpenAI SSE conversion
+  -- For now, just pass through (will need to parse Gemini events and convert)
+  let loop = do
+        chunk <- brRead bodyReader
+        if BS.null chunk
+          then pure ()
+          else do
+            -- Simple pass-through for now
+            write (byteString chunk)
+            flush
+            loop
+  loop
 
 -- | Convert StreamEvent to SSE format
 eventToSSE :: StreamEvent -> BS.ByteString
