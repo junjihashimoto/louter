@@ -28,6 +28,9 @@ import Network.Wai
 import Network.Wai.Handler.Warp (run)
 import Options.Applicative
 import System.IO (hFlush, stdout)
+import System.Random (randomIO)
+import Data.Word (Word64)
+import Text.Printf (printf)
 
 import Louter.Client (Client, Backend(..), newClient, chatCompletion, streamChat)
 import Louter.Client.OpenAI (llamaServerClient)
@@ -129,11 +132,39 @@ initClients Config{..} = do
       client <- llamaServerClient backendUrl
       return (name, client)
 
+-- | Generate a trace ID for request tracking
+generateTraceId :: IO Text
+generateTraceId = do
+  rnd <- randomIO :: IO Word64
+  return $ T.pack $ printf "trace-%016x" rnd
+
+-- | Log event in JSON line format
+logEvent :: Text -> Text -> Value -> IO ()
+logEvent traceId eventType details = do
+  let logLine = object
+        [ "trace_id" .= traceId
+        , "event" .= eventType
+        , "details" .= details
+        ]
+  BS8.putStrLn (BL.toStrict $ encode logLine)
+  hFlush stdout
+
 -- | Main WAI application with manual routing
 application :: AppState -> Application
 application state req respond = do
+  -- Generate trace ID for this request
+  traceId <- generateTraceId
+
   let path = pathInfo req
       method = requestMethod req
+      pathStr = T.intercalate "/" path
+
+  -- Log incoming request in JSON line format
+  logEvent traceId "request_received" $ object
+    [ "method" .= TE.decodeUtf8 method
+    , "path" .= pathStr
+    , "query" .= TE.decodeUtf8 (rawQueryString req)
+    ]
 
   case (method, path) of
     -- Health check
@@ -154,16 +185,35 @@ application state req respond = do
 
     -- Gemini API - model actions (generate/stream)
     ("POST", "v1beta" : "models" : modelPath) ->
-      geminiModelActionHandler state modelPath req respond
+      geminiModelActionHandler traceId state modelPath req respond
 
     -- Diagnostics
     ("GET", ["api", "diagnostics"]) ->
       diagnosticsHandler state req respond
 
     -- Default 404
-    _ -> respond $ responseLBS status404
-           [("Content-Type", "application/json")]
-           (encode $ object ["error" .= ("Not found" :: Text)])
+    _ -> do
+      logEvent traceId "not_found" $ object
+        [ "method" .= TE.decodeUtf8 method
+        , "path" .= pathStr
+        , "available_endpoints" .=
+            [ "/health" :: Text
+            , "/v1/chat/completions"
+            , "/v1/messages"
+            , "/v1beta/models"
+            , "/v1beta/models/:model:streamGenerateContent"
+            , "/v1beta/models/:model:generateContent"
+            ]
+        ]
+      respond $ responseLBS status404
+        [("Content-Type", "application/json")]
+        (encode $ object
+          [ "error" .= object
+              [ "code" .= (404 :: Int)
+              , "message" .= ("Requested entity was not found." :: Text)
+              , "status" .= ("NOT_FOUND" :: Text)
+              ]
+          ])
 
 -- | /health endpoint
 healthHandler :: AppState -> Application
@@ -705,14 +755,22 @@ openAIResponseToAnthropic _ = object []
 -- ==============================================================================
 
 -- | Handle Gemini streaming request
-handleGeminiStreaming :: AppState -> Text -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
-handleGeminiStreaming state modelName geminiReq respond = do
-  case geminiToOpenAI modelName geminiReq of
-    Left err -> respond $ responseLBS status400
-      [("Content-Type", "application/json")]
-      (encode $ object ["error" .= err])
+handleGeminiStreaming :: Text -> AppState -> Text -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
+handleGeminiStreaming traceId state modelName geminiReq respond = do
+  case geminiToOpenAI modelName True geminiReq of
+    Left err -> do
+      logEvent traceId "gemini_to_openai_error" $ object ["error" .= err]
+      respond $ responseLBS status400
+        [("Content-Type", "application/json")]
+        (encode $ object ["error" .= err])
 
     Right openAIReq -> do
+      -- Log converted OpenAI request
+      logEvent traceId "openai_request" $ object
+        [ "backend_url" .= ("http://localhost:11211/v1/chat/completions" :: Text)
+        , "request" .= openAIReq
+        ]
+
       -- Create backend HTTP request
       let backendUrl = "http://localhost:11211/v1/chat/completions"
       req <- HTTP.parseRequest ("POST " <> backendUrl)
@@ -730,15 +788,22 @@ handleGeminiStreaming state modelName geminiReq respond = do
             ] $ \write flush -> do
               withResponse req' (appManager state) $ \backendResp -> do
                 let body = HTTP.responseBody backendResp
+                    statusCode = HTTP.responseStatus backendResp
+
+                -- Log backend response status
+                logEvent traceId "backend_response" $ object
+                  [ "status" .= show statusCode
+                  ]
+
                 -- Convert OpenAI SSE to Gemini SSE
                 convertOpenAIToGeminiStream write flush body
 
       respond streamResponse
 
 -- | Handle Gemini non-streaming request
-handleGeminiNonStreaming :: AppState -> Text -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
-handleGeminiNonStreaming state modelName geminiReq respond = do
-  case geminiToOpenAI modelName geminiReq of
+handleGeminiNonStreaming :: Text -> AppState -> Text -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
+handleGeminiNonStreaming traceId state modelName geminiReq respond = do
+  case geminiToOpenAI modelName False geminiReq of
     Left err -> respond $ responseLBS status400
       [("Content-Type", "application/json")]
       (encode $ object ["error" .= err])
@@ -767,9 +832,73 @@ handleGeminiNonStreaming state modelName geminiReq respond = do
             [("Content-Type", "application/json")]
             (encode $ openAIResponseToGemini openAIResp)
 
+-- | Handle Gemini countTokens request
+handleCountTokens :: Text -> AppState -> Text -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
+handleCountTokens traceId state modelName geminiReq respond = do
+  -- Log countTokens request
+  logEvent traceId "count_tokens_request" $ object
+    [ "model" .= modelName
+    , "request" .= geminiReq
+    ]
+
+  case geminiToOpenAI modelName False geminiReq of
+    Left err -> do
+      logEvent traceId "gemini_to_openai_error" $ object ["error" .= err]
+      respond $ responseLBS status400
+        [("Content-Type", "application/json")]
+        (encode $ object ["error" .= err])
+
+    Right openAIReq -> do
+      -- Estimate tokens from the OpenAI request
+      let totalTokens = estimateTokensFromRequest openAIReq
+
+      -- Log token count result
+      logEvent traceId "count_tokens_result" $ object
+        [ "model" .= modelName
+        , "total_tokens" .= totalTokens
+        ]
+
+      -- Return Gemini countTokens response format
+      respond $ responseLBS status200
+        [("Content-Type", "application/json")]
+        (encode $ object ["totalTokens" .= totalTokens])
+
+-- | Estimate tokens from an OpenAI request
+-- Simple heuristic: ~4 characters per token
+estimateTokensFromRequest :: Value -> Int
+estimateTokensFromRequest (Object obj) =
+  let messagesTokens = case HM.lookup "messages" obj of
+        Just (Array msgs) -> sum $ map estimateTokensFromMessage (V.toList msgs)
+        _ -> 0
+      toolsTokens = case HM.lookup "tools" obj of
+        Just (Array tools) -> sum $ map estimateTokensFromValue (V.toList tools)
+        _ -> 0
+  in max 1 (messagesTokens + toolsTokens)
+estimateTokensFromRequest _ = 1
+
+-- | Estimate tokens from a single message
+estimateTokensFromMessage :: Value -> Int
+estimateTokensFromMessage (Object msg) =
+  case HM.lookup "content" msg of
+    Just (String txt) -> estimateTokensFromText txt
+    Just val -> estimateTokensFromValue val
+    Nothing -> 0
+estimateTokensFromMessage _ = 0
+
+-- | Estimate tokens from text
+estimateTokensFromText :: Text -> Int
+estimateTokensFromText txt = max 1 ((T.length txt + 3) `div` 4)
+
+-- | Estimate tokens from any JSON value
+estimateTokensFromValue :: Value -> Int
+estimateTokensFromValue (String txt) = estimateTokensFromText txt
+estimateTokensFromValue (Array arr) = sum $ map estimateTokensFromValue (V.toList arr)
+estimateTokensFromValue (Object obj) = sum $ map estimateTokensFromValue (HM.elems obj)
+estimateTokensFromValue _ = 1
+
 -- | Convert Gemini request to OpenAI format
-geminiToOpenAI :: Text -> Value -> Either Text Value
-geminiToOpenAI modelName (Object obj) = do
+geminiToOpenAI :: Text -> Bool -> Value -> Either Text Value
+geminiToOpenAI modelName streaming (Object obj) = do
   -- Extract contents array
   contents <- case HM.lookup "contents" obj of
     Just (Array cs) -> Right $ V.toList cs
@@ -807,12 +936,12 @@ geminiToOpenAI modelName (Object obj) = do
   Right $ object $
     [ "model" .= modelName
     , "messages" .= (systemMsg ++ messages)
-    , "stream" .= True
+    , "stream" .= streaming
     ] ++ (case temperature of Just t -> ["temperature" .= t]; Nothing -> [])
       ++ (case maxTokens of Just m -> ["max_tokens" .= m]; Nothing -> [])
       ++ (case tools of Just t -> ["tools" .= convertGeminiToolsToOpenAI t]; Nothing -> [])
 
-geminiToOpenAI _ _ = Left "Request must be a JSON object"
+geminiToOpenAI _ _ _ = Left "Request must be a JSON object"
 
 -- | Convert Gemini content to OpenAI message
 convertGeminiContentToMessage :: Value -> Either Text Value
@@ -973,14 +1102,16 @@ geminiListModelsHandler _state _req respond =
     (encode $ object ["error" .= ("Gemini list models not yet implemented" :: Text)])
 
 -- | /v1beta/models/:model:action - Gemini model actions
-geminiModelActionHandler :: AppState -> [Text] -> Application
-geminiModelActionHandler state modelPath req respond = do
+geminiModelActionHandler :: Text -> AppState -> [Text] -> Application
+geminiModelActionHandler traceId state modelPath req respond = do
   -- Parse model and action from path
   -- Path format: ["model-name:streamGenerateContent"] or ["model-name:generateContent"]
   case modelPath of
-    [] -> respond $ responseLBS status400
-      [("Content-Type", "application/json")]
-      (encode $ object ["error" .= ("Missing model path" :: Text)])
+    [] -> do
+      logEvent traceId "error" $ object ["message" .= ("Missing model path" :: Text)]
+      respond $ responseLBS status400
+        [("Content-Type", "application/json")]
+        (encode $ object ["error" .= ("Missing model path" :: Text)])
 
     (fullPath:_) -> do
       -- Split on ':' to get model and action
@@ -989,19 +1120,47 @@ geminiModelActionHandler state modelPath req respond = do
         [modelName, action] -> do
           -- Read request body
           body <- strictRequestBody req
+
+          -- Log incoming Gemini request
           case eitherDecode body of
-            Left err -> respond $ responseLBS status400
-              [("Content-Type", "application/json")]
-              (encode $ object ["error" .= ("Invalid Gemini request: " <> T.pack err :: Text)])
+            Left err -> do
+              logEvent traceId "request_parse_error" $ object
+                [ "error" .= T.pack err
+                , "body_size" .= BL.length body
+                ]
+              respond $ responseLBS status400
+                [("Content-Type", "application/json")]
+                (encode $ object ["error" .= ("Invalid Gemini request: " <> T.pack err :: Text)])
 
             Right geminiReq -> do
-              if action == "streamGenerateContent"
-                then handleGeminiStreaming state modelName geminiReq respond
-                else handleGeminiNonStreaming state modelName geminiReq respond
+              -- Log parsed Gemini request
+              logEvent traceId "gemini_request_parsed" $ object
+                [ "model" .= modelName
+                , "action" .= action
+                , "request" .= geminiReq
+                ]
 
-        _ -> respond $ responseLBS status400
-          [("Content-Type", "application/json")]
-          (encode $ object ["error" .= ("Invalid model path format" :: Text)])
+              case action of
+                "streamGenerateContent" -> handleGeminiStreaming traceId state modelName geminiReq respond
+                "generateContent" -> handleGeminiNonStreaming traceId state modelName geminiReq respond
+                "countTokens" -> handleCountTokens traceId state modelName geminiReq respond
+                _ -> do
+                  logEvent traceId "error" $ object
+                    [ "message" .= ("Unsupported action" :: Text)
+                    , "action" .= action
+                    ]
+                  respond $ responseLBS status400
+                    [("Content-Type", "application/json")]
+                    (encode $ object ["error" .= ("Unsupported action: " <> action :: Text)])
+
+        _ -> do
+          logEvent traceId "error" $ object
+            [ "message" .= ("Invalid model path format" :: Text)
+            , "path" .= fullPath
+            ]
+          respond $ responseLBS status400
+            [("Content-Type", "application/json")]
+            (encode $ object ["error" .= ("Invalid model path format" :: Text)])
 
 -- | /api/diagnostics endpoint
 diagnosticsHandler :: AppState -> Application

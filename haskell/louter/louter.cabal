@@ -87,6 +87,7 @@ executable louter-server
     , transformers
     , mtl
     , vector
+    , random
 
 test-suite louter-test
   type: exitcode-stdio-1.0
