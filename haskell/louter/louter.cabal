@@ -23,6 +23,9 @@ library
       Louter.Protocol.AnthropicStreaming
       Louter.Protocol.GeminiConverter
       Louter.Protocol.GeminiStreaming
+      -- Backend protocol conversions (for multi-backend support)
+      Louter.Backend.OpenAIToAnthropic
+      Louter.Backend.OpenAIToGemini
       -- Types
       Louter.Types
       Louter.Types.Request
