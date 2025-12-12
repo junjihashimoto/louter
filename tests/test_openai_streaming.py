@@ -18,9 +18,9 @@ from typing import List, Dict, Any, Optional
 from openai import OpenAI
 
 # Test configuration
-PROXY_URL = os.getenv("OPENAI_BASE_URL", "http://localhost:9000")
+PROXY_URL = os.getenv("OPENAI_BASE_URL", "http://localhost:9000/v1")
 API_KEY = os.getenv("OPENAI_API_KEY", "test-key")  # Proxy may ignore this for llama-server
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4")
+MODEL = os.getenv("OPENAI_MODEL", "gpt-oss")
 
 
 class StreamChunkCapture:
