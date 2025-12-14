@@ -1,6 +1,17 @@
-# Rust build outputs
-/target/
-Cargo.lock
+# Haskell build outputs
+/dist-newstyle/
+/.stack-work/
+/haskell/.stack-work/
+*.hi
+*.o
+*.prof
+*.aux
+*.hp
+*.eventlog
+cabal.project.local
+cabal.project.local~
+.HTF/
+.ghc.environment.*
 
 # IDE and editor files
 .DS_Store
