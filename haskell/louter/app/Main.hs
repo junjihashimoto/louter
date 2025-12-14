@@ -17,6 +17,7 @@ import Data.ByteString.Builder (Builder, byteString)
 import Data.Conduit ((.|), runConduit, await)
 import qualified Data.Conduit.List as CL
 import qualified Data.HashMap.Strict as HMS
+import qualified Data.HashMap.Lazy as HML
 import Data.List (sortBy)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -36,9 +37,12 @@ import System.IO (hFlush, stdout)
 import System.Random (randomIO)
 import Data.Word (Word64)
 import Text.Printf (printf)
+import qualified Data.Yaml as Yaml
 
 import Louter.Client (Client, Backend(..), newClient, chatCompletion, streamChat)
-import Louter.Client.OpenAI (llamaServerClient)
+import Louter.Client.OpenAI (llamaServerClient, openAIClientWithUrl)
+import Louter.Client.Anthropic (anthropicClientWithUrl)
+import Louter.Client.Gemini (geminiClientWithUrl)
 import Louter.Types.Request (ChatRequest(..), Message(..), MessageRole(..), ContentPart(..), Tool(..), ToolChoice(..))
 import Louter.Types.Streaming (StreamEvent(..))
 import Louter.Types.ToolFormat (XMLToolCallState, initialXMLState)
@@ -72,10 +76,22 @@ data BackendType
   | BackendTypeGemini    -- Google Gemini API
   deriving (Show, Eq)
 
+instance Yaml.FromJSON BackendType where
+  parseJSON = Yaml.withText "BackendType" $ \t -> case t of
+    "openai" -> pure BackendTypeOpenAI
+    "anthropic" -> pure BackendTypeAnthropic
+    "gemini" -> pure BackendTypeGemini
+    other -> fail $ "Unknown backend type: " <> T.unpack other
+
 -- | Simplified config (will expand later)
 data Config = Config
   { configBackends :: Map Text BackendConfig
   } deriving (Show)
+
+instance Yaml.FromJSON Config where
+  parseJSON = Yaml.withObject "Config" $ \obj -> do
+    backends <- obj Yaml..: "backends"
+    pure $ Config backends
 
 data BackendConfig = BackendConfig
   { backendType :: BackendType
@@ -85,6 +101,39 @@ data BackendConfig = BackendConfig
   , backendModelMapping :: Map Text Text  -- frontend model -> backend model
   , backendToolFormat :: Text  -- "json" (default) or "xml" (Qwen3-Coder)
   } deriving (Show)
+
+instance Yaml.FromJSON BackendConfig where
+  parseJSON = Yaml.withObject "BackendConfig" $ \obj -> do
+    btype <- obj Yaml..: "type"
+    url <- obj Yaml..: "url"
+    apiKey <- obj Yaml..:? "api_key"
+    reqAuth <- obj Yaml..: "requires_auth"
+    modelMap <- obj Yaml..:? "model_mapping" Yaml..!= Map.empty
+    toolFmt <- obj Yaml..:? "tool_format" Yaml..!= "json"
+    pure $ BackendConfig btype url apiKey reqAuth modelMap toolFmt
+
+-- | Load config from YAML file
+loadConfig :: FilePath -> IO Config
+loadConfig path = do
+  result <- Yaml.decodeFileEither path
+  case result of
+    Left err -> do
+      putStrLn $ "Error loading config from " <> path <> ":"
+      putStrLn $ "  " <> show err
+      putStrLn "Using default config with llama-server (no auth)"
+      -- Return default config as fallback
+      pure $ Config
+        { configBackends = Map.fromList
+            [("llama-server", BackendConfig
+                { backendType = BackendTypeOpenAI
+                , backendUrl = "http://localhost:11211"
+                , backendApiKey = Nothing
+                , backendRequiresAuth = False
+                , backendModelMapping = Map.empty
+                , backendToolFormat = "json"
+                })]
+        }
+    Right cfg -> pure cfg
 
 -- | CLI parser
 serverConfigParser :: Parser ServerConfig
@@ -109,26 +158,16 @@ main = do
   putStrLn $ "Louter proxy server starting on port " <> show serverPort
   putStrLn $ "Using config file: " <> serverConfigFile
 
-  -- For now, create a default config with llama-server
-  let defaultConfig = Config
-        { configBackends = Map.fromList
-            [("llama", BackendConfig
-                { backendType = BackendTypeOpenAI
-                , backendUrl = "http://localhost:11211"
-                , backendApiKey = Nothing
-                , backendRequiresAuth = False
-                , backendModelMapping = Map.empty
-                , backendToolFormat = "json"  -- Default to JSON format
-                })]
-        }
+  -- Load config from TOML file
+  config <- loadConfig serverConfigFile
 
   -- Initialize clients and HTTP manager
-  clients <- initClients defaultConfig
+  clients <- initClients config
   manager <- HTTP.newManager tlsManagerSettings
 
   let appState = AppState
         { appClients = clients
-        , appConfig = defaultConfig
+        , appConfig = config
         , appPort = serverPort
         , appManager = manager
         }
@@ -154,7 +193,24 @@ initClients Config{..} = do
   where
     initBackend :: (Text, BackendConfig) -> IO (Text, Client)
     initBackend (name, BackendConfig{..}) = do
-      client <- llamaServerClient backendUrl
+      client <- case backendType of
+        BackendTypeOpenAI ->
+          if backendRequiresAuth
+            then case backendApiKey of
+              Just key -> openAIClientWithUrl key backendUrl
+              Nothing -> error $ "Backend '" <> T.unpack name <> "' requires authentication but no api_key provided"
+            else llamaServerClient backendUrl
+
+        BackendTypeAnthropic ->
+          case backendApiKey of
+            Just key -> anthropicClientWithUrl key backendUrl
+            Nothing -> error $ "Backend '" <> T.unpack name <> "' (Anthropic) requires authentication but no api_key provided"
+
+        BackendTypeGemini ->
+          case backendApiKey of
+            Just key -> geminiClientWithUrl key backendUrl
+            Nothing -> error $ "Backend '" <> T.unpack name <> "' (Gemini) requires authentication but no api_key provided"
+
       return (name, client)
 
 -- | Generate a trace ID for request tracking
@@ -659,12 +715,19 @@ anthropicMessagesHandler state req respond = do
       (encode $ object ["error" .= ("Invalid Anthropic request: " <> T.pack err :: Text)])
 
     Right anthropicReq -> do
-      -- Check if streaming
-      let isStreaming = getAnthropicStreamFlag anthropicReq
+      -- Get first backend (for now - TODO: support backend selection via model name)
+      case Map.toList (configBackends $ appConfig state) of
+        [] -> respond $ responseLBS status500
+          [("Content-Type", "application/json")]
+          (encode $ object ["error" .= ("No backend configured" :: Text)])
 
-      if isStreaming
-        then handleAnthropicStreaming state anthropicReq respond
-        else handleAnthropicNonStreaming state anthropicReq respond
+        ((backendName, backendCfg):_) -> do
+          -- Check if streaming
+          let isStreaming = getAnthropicStreamFlag anthropicReq
+
+          if isStreaming
+            then handleAnthropicStreaming state backendCfg anthropicReq respond
+            else handleAnthropicNonStreaming state backendCfg anthropicReq respond
 
 -- | Get Anthropic stream flag
 getAnthropicStreamFlag :: Value -> Bool
@@ -674,8 +737,8 @@ getAnthropicStreamFlag (Object obj) = case HM.lookup "stream" obj of
 getAnthropicStreamFlag _ = False
 
 -- | Handle Anthropic streaming request
-handleAnthropicStreaming :: AppState -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
-handleAnthropicStreaming state anthropicReq respond = do
+handleAnthropicStreaming :: AppState -> BackendConfig -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
+handleAnthropicStreaming state backendCfg anthropicReq respond = do
   -- Convert Anthropic request to OpenAI format
   case anthropicToOpenAI anthropicReq of
     Left err -> respond $ responseLBS status400
@@ -684,9 +747,9 @@ handleAnthropicStreaming state anthropicReq respond = do
 
     Right openAIReq -> do
       -- Make request to backend
-      let backendUrl = "http://localhost:11211/v1/chat/completions"
+      let backendUrlStr = T.unpack (backendUrl backendCfg) <> "/v1/chat/completions"
 
-      req <- HTTP.parseRequest ("POST " <> backendUrl)
+      req <- HTTP.parseRequest ("POST " <> backendUrlStr)
       let req' = req
             { HTTP.requestBody = HTTP.RequestBodyLBS (encode openAIReq)
             , HTTP.requestHeaders = [("Content-Type", "application/json")]
@@ -706,17 +769,17 @@ handleAnthropicStreaming state anthropicReq respond = do
       respond sseResponse
 
 -- | Handle Anthropic non-streaming request
-handleAnthropicNonStreaming :: AppState -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
-handleAnthropicNonStreaming state anthropicReq respond = do
+handleAnthropicNonStreaming :: AppState -> BackendConfig -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
+handleAnthropicNonStreaming state backendCfg anthropicReq respond = do
   case anthropicToOpenAI anthropicReq of
     Left err -> respond $ responseLBS status400
       [("Content-Type", "application/json")]
       (encode $ object ["error" .= err])
 
     Right openAIReq -> do
-      let backendUrl = "http://localhost:11211/v1/chat/completions"
+      let backendUrlStr = T.unpack (backendUrl backendCfg) <> "/v1/chat/completions"
 
-      req <- HTTP.parseRequest ("POST " <> backendUrl)
+      req <- HTTP.parseRequest ("POST " <> backendUrlStr)
       let req' = req
             { HTTP.requestBody = HTTP.RequestBodyLBS (encode openAIReq)
             , HTTP.requestHeaders = [("Content-Type", "application/json")]
@@ -746,8 +809,8 @@ handleAnthropicNonStreaming state anthropicReq respond = do
 -- Supports two formats based on ?alt= parameter:
 -- - alt=sse (default): Server-Sent Events format
 -- - alt=json: JSON array format
-handleGeminiStreaming :: Text -> AppState -> Text -> Value -> Request -> (Response -> IO ResponseReceived) -> IO ResponseReceived
-handleGeminiStreaming traceId state modelName geminiReq req respond = do
+handleGeminiStreaming :: Text -> AppState -> BackendConfig -> Text -> Value -> Request -> (Response -> IO ResponseReceived) -> IO ResponseReceived
+handleGeminiStreaming traceId state backendCfg modelName geminiReq req respond = do
   -- Detect streaming format from query parameter
   let queryParams = queryString req
       altParam = lookup "alt" queryParams
@@ -773,17 +836,18 @@ handleGeminiStreaming traceId state modelName geminiReq req respond = do
         (encode $ object ["error" .= err])
 
     Right openAIReq -> do
+      -- Create backend HTTP request
+      let backendUrlStr = T.unpack (backendUrl backendCfg) <> "/v1/chat/completions"
+
       -- Log converted OpenAI request
       logEvent traceId "openai_request" $ object
-        [ "backend_url" .= ("http://localhost:11211/v1/chat/completions" :: Text)
+        [ "backend_url" .= backendUrlStr
         , "request" .= openAIReq
         , "streaming" .= True
         , "format" .= TE.decodeUtf8 streamFormat
         ]
 
-      -- Create backend HTTP request
-      let backendUrl = "http://localhost:11211/v1/chat/completions"
-      backendReq <- HTTP.parseRequest ("POST " <> backendUrl)
+      backendReq <- HTTP.parseRequest ("POST " <> backendUrlStr)
       let backendReq' = backendReq
             { HTTP.requestBody = HTTP.RequestBodyLBS (encode openAIReq)
             , HTTP.requestHeaders = [("Content-Type", "application/json")]
@@ -851,8 +915,8 @@ handleJsonArrayStreaming traceId backendReq state respond = do
   respond streamResponse
 
 -- | Handle Gemini non-streaming request
-handleGeminiNonStreaming :: Text -> AppState -> Text -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
-handleGeminiNonStreaming traceId state modelName geminiReq respond = do
+handleGeminiNonStreaming :: Text -> AppState -> BackendConfig -> Text -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
+handleGeminiNonStreaming traceId state backendCfg modelName geminiReq respond = do
   case geminiToOpenAI modelName False geminiReq of
     Left err -> do
       logEvent traceId "gemini_to_openai_error" $ object
@@ -864,16 +928,17 @@ handleGeminiNonStreaming traceId state modelName geminiReq respond = do
         (encode $ object ["error" .= err])
 
     Right openAIReq -> do
+      -- Create backend HTTP request
+      let backendUrlStr = T.unpack (backendUrl backendCfg) <> "/v1/chat/completions"
+
       -- Log converted OpenAI request
       logEvent traceId "openai_request" $ object
-        [ "backend_url" .= ("http://localhost:11211/v1/chat/completions" :: Text)
+        [ "backend_url" .= backendUrlStr
         , "request" .= openAIReq
         , "streaming" .= False
         ]
 
-      -- Create backend HTTP request
-      let backendUrl = "http://localhost:11211/v1/chat/completions"
-      req <- HTTP.parseRequest ("POST " <> backendUrl)
+      req <- HTTP.parseRequest ("POST " <> backendUrlStr)
       let req' = req
             { HTTP.requestBody = HTTP.RequestBodyLBS (encode openAIReq)
             , HTTP.requestHeaders = [("Content-Type", "application/json")]
@@ -910,8 +975,8 @@ handleGeminiNonStreaming traceId state modelName geminiReq respond = do
             (encode $ openAIResponseToGemini openAIResp)
 
 -- | Handle Gemini countTokens request
-handleCountTokens :: Text -> AppState -> Text -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
-handleCountTokens traceId state modelName geminiReq respond = do
+handleCountTokens :: Text -> AppState -> BackendConfig -> Text -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
+handleCountTokens traceId state backendCfg modelName geminiReq respond = do
   -- Log countTokens request
   logEvent traceId "count_tokens_request" $ object
     [ "model" .= modelName
@@ -1014,17 +1079,26 @@ geminiModelActionHandler traceId state modelPath req respond = do
                 (encode $ object ["error" .= ("Invalid Gemini request: " <> T.pack err :: Text)])
 
             Right geminiReq -> do
-              -- Log parsed Gemini request
-              logEvent traceId "gemini_request_parsed" $ object
-                [ "model" .= modelName
-                , "action" .= action
-                , "request" .= geminiReq
-                ]
+              -- Get first backend (for now - TODO: support backend selection via model name)
+              case Map.toList (configBackends $ appConfig state) of
+                [] -> do
+                  logEvent traceId "error" $ object ["message" .= ("No backend configured" :: Text)]
+                  respond $ responseLBS status500
+                    [("Content-Type", "application/json")]
+                    (encode $ object ["error" .= ("No backend configured" :: Text)])
 
-              case action of
-                "streamGenerateContent" -> handleGeminiStreaming traceId state modelName geminiReq req respond
-                "generateContent" -> handleGeminiNonStreaming traceId state modelName geminiReq respond
-                "countTokens" -> handleCountTokens traceId state modelName geminiReq respond
+                ((backendName, backendCfg):_) -> do
+                  -- Log parsed Gemini request
+                  logEvent traceId "gemini_request_parsed" $ object
+                    [ "model" .= modelName
+                    , "action" .= action
+                    , "request" .= geminiReq
+                    ]
+
+                  case action of
+                    "streamGenerateContent" -> handleGeminiStreaming traceId state backendCfg modelName geminiReq req respond
+                    "generateContent" -> handleGeminiNonStreaming traceId state backendCfg modelName geminiReq respond
+                    "countTokens" -> handleCountTokens traceId state backendCfg modelName geminiReq respond
                 _ -> do
                   logEvent traceId "error" $ object
                     [ "message" .= ("Unsupported action" :: Text)
