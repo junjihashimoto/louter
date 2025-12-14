@@ -6,7 +6,7 @@
 module Main where
 
 import Control.Applicative ((<|>))
-import Control.Monad (foldM, forM_, unless, when)
+import Control.Monad (foldM, forM_, unless, when, join)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (Value(..), Object, encode, eitherDecode, object, (.=))
 import qualified Data.Aeson.KeyMap as HM
@@ -45,6 +45,7 @@ import Louter.Protocol.AnthropicConverter
 import Louter.Protocol.AnthropicStreaming
 import Louter.Protocol.GeminiConverter
 import Louter.Protocol.GeminiStreaming
+import Louter.Protocol.GeminiStreamingJsonArray
 import Louter.Backend.OpenAIToAnthropic
 import Louter.Backend.OpenAIToGemini
 
@@ -707,8 +708,25 @@ handleAnthropicNonStreaming state anthropicReq respond = do
 -- ==============================================================================
 
 -- | Handle Gemini streaming request
-handleGeminiStreaming :: Text -> AppState -> Text -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
-handleGeminiStreaming traceId state modelName geminiReq respond = do
+-- Supports two formats based on ?alt= parameter:
+-- - alt=sse (default): Server-Sent Events format
+-- - alt=json: JSON array format
+handleGeminiStreaming :: Text -> AppState -> Text -> Value -> Request -> (Response -> IO ResponseReceived) -> IO ResponseReceived
+handleGeminiStreaming traceId state modelName geminiReq req respond = do
+  -- Detect streaming format from query parameter
+  let queryParams = queryString req
+      altParam = lookup "alt" queryParams
+      streamFormat :: BS.ByteString
+      streamFormat = case altParam of
+        Just (Just "json") -> "json"
+        Just (Just "sse") -> "sse"
+        _ -> "sse"  -- Default to SSE for backward compatibility
+
+  logEvent traceId "stream_format_detected" $ object
+    [ "format" .= TE.decodeUtf8 streamFormat
+    , "alt_param" .= (TE.decodeUtf8 <$> join altParam :: Maybe Text)
+    ]
+
   case geminiToOpenAI modelName True geminiReq of
     Left err -> do
       logEvent traceId "gemini_to_openai_error" $ object
@@ -725,38 +743,77 @@ handleGeminiStreaming traceId state modelName geminiReq respond = do
         [ "backend_url" .= ("http://localhost:11211/v1/chat/completions" :: Text)
         , "request" .= openAIReq
         , "streaming" .= True
+        , "format" .= TE.decodeUtf8 streamFormat
         ]
 
       -- Create backend HTTP request
       let backendUrl = "http://localhost:11211/v1/chat/completions"
-      req <- HTTP.parseRequest ("POST " <> backendUrl)
-      let req' = req
+      backendReq <- HTTP.parseRequest ("POST " <> backendUrl)
+      let backendReq' = backendReq
             { HTTP.requestBody = HTTP.RequestBodyLBS (encode openAIReq)
             , HTTP.requestHeaders = [("Content-Type", "application/json")]
             }
 
-      -- Stream response and convert OpenAI SSE → Gemini SSE
-      -- Note: Gemini uses SSE format with "data: {...}\n\n" (NOT arrays)
-      let streamResponse = responseStream status200
-            [ ("Content-Type", "text/event-stream; charset=utf-8")
-            , ("Cache-Control", "no-cache")
-            , ("Connection", "keep-alive")
-            ] $ \write flush -> do
-              withResponse req' (appManager state) $ \backendResp -> do
-                let body = HTTP.responseBody backendResp
-                    statusCode = HTTP.responseStatus backendResp
+      -- Choose response format based on alt= parameter
+      case streamFormat of
+        "json" -> handleJsonArrayStreaming traceId backendReq' state respond
+        _ -> handleSSEStreaming traceId backendReq' state respond
 
-                -- Log backend response status
-                logEvent traceId "backend_response" $ object
-                  [ "status" .= show statusCode
-                  , "streaming" .= True
-                  ]
+-- | Handle SSE format streaming (default)
+handleSSEStreaming :: Text -> HTTP.Request -> AppState -> (Response -> IO ResponseReceived) -> IO ResponseReceived
+handleSSEStreaming traceId backendReq state respond = do
+  let streamResponse = responseStream status200
+        [ ("Content-Type", "text/event-stream; charset=utf-8")
+        , ("Cache-Control", "no-cache")
+        , ("Connection", "keep-alive")
+        ] $ \write flush -> do
+          withResponse backendReq (appManager state) $ \backendResp -> do
+            let body = HTTP.responseBody backendResp
+                statusCode = HTTP.responseStatus backendResp
 
-                -- Convert OpenAI SSE to Gemini SSE
-                convertOpenAIToGeminiStream write flush body
+            -- Log backend response status
+            logEvent traceId "backend_response" $ object
+              [ "status" .= show statusCode
+              , "streaming" .= True
+              , "format" .= ("sse" :: Text)
+              ]
 
-      logEvent traceId "streaming_started" $ object ["status" .= ("ok" :: Text)]
-      respond streamResponse
+            -- Convert OpenAI SSE to Gemini SSE
+            convertOpenAIToGeminiStream write flush body
+
+  logEvent traceId "streaming_started" $ object
+    [ "status" .= ("ok" :: Text)
+    , "format" .= ("sse" :: Text)
+    ]
+  respond streamResponse
+
+-- | Handle JSON array format streaming (alt=json)
+-- Streams an incremental JSON array: [{"candidates":[...]},{"candidates":[...]},...]
+handleJsonArrayStreaming :: Text -> HTTP.Request -> AppState -> (Response -> IO ResponseReceived) -> IO ResponseReceived
+handleJsonArrayStreaming traceId backendReq state respond = do
+  let streamResponse = responseStream status200
+        [ ("Content-Type", "application/json; charset=utf-8")
+        , ("Cache-Control", "no-cache")
+        ] $ \write flush -> do
+          withResponse backendReq (appManager state) $ \backendResp -> do
+            let body = HTTP.responseBody backendResp
+                statusCode = HTTP.responseStatus backendResp
+
+            -- Log backend response status
+            logEvent traceId "backend_response" $ object
+              [ "status" .= show statusCode
+              , "streaming" .= True
+              , "format" .= ("json" :: Text)
+              ]
+
+            -- Convert OpenAI SSE to Gemini JSON array (incremental)
+            convertOpenAIToGeminiJsonArray write flush body
+
+  logEvent traceId "streaming_started" $ object
+    [ "status" .= ("ok" :: Text)
+    , "format" .= ("json" :: Text)
+    ]
+  respond streamResponse
 
 -- | Handle Gemini non-streaming request
 handleGeminiNonStreaming :: Text -> AppState -> Text -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
@@ -930,7 +987,7 @@ geminiModelActionHandler traceId state modelPath req respond = do
                 ]
 
               case action of
-                "streamGenerateContent" -> handleGeminiStreaming traceId state modelName geminiReq respond
+                "streamGenerateContent" -> handleGeminiStreaming traceId state modelName geminiReq req respond
                 "generateContent" -> handleGeminiNonStreaming traceId state modelName geminiReq respond
                 "countTokens" -> handleCountTokens traceId state modelName geminiReq respond
                 _ -> do

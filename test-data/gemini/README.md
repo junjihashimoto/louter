@@ -15,8 +15,11 @@ Gemini supports **two streaming formats**:
 ```
 
 **Used by:**
-- Python SDK (default)
 - Direct API calls with `?alt=json`
+- HTTP clients that can parse streaming JSON arrays
+
+**⚠️ Python SDK Compatibility:**
+The official Google Generative AI Python SDK has known issues with JSON array streaming format due to HTTP chunked transfer encoding. Use SSE format (`alt=sse`) with the Python SDK instead.
 
 **Example request:**
 ```bash
@@ -39,6 +42,7 @@ data: {"candidates": [...], "finishReason": "STOP"}
 ```
 
 **Used by:**
+- **Python SDK (recommended)** - Works reliably with streaming
 - Web applications
 - Direct API calls with `?alt=sse`
 - EventSource API in browsers
@@ -59,7 +63,7 @@ curl "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:s
 | Format | `[{...}, {...}]` | `data: {...}\n\ndata: {...}\n\n` |
 | Parsing | Parse entire JSON array | Parse line-by-line SSE |
 | Browser API | Fetch API | EventSource API |
-| Default SDK | Python SDK | JavaScript/Browser |
+| Python SDK | ❌ Not compatible | ✅ Works reliably |
 
 ## Implementation Notes
 
@@ -84,10 +88,10 @@ curl "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:s
 
 ## Test Coverage
 
-- ✅ `streaming_jsonarray/` - JSON array format test data
+- ✅ `streaming_jsonarray/` - JSON array format test data (curl validation)
 - ✅ `streaming_sse/` - SSE format test data
-- ✅ `tests/test_gemini_streaming_jsonarray.py` - Python SDK tests (JSON array)
-- ⚠️  TODO: SSE format tests needed
+- ✅ `tests/test_gemini_sse_streaming.py` - Python SDK tests (SSE format)
+- ✅ Both formats implemented in louter proxy
 
 ## Usage
 
