@@ -1,0 +1,96 @@
+# Multi-Backend Configuration
+# ============================
+# Advanced configuration with multiple backends for different use cases.
+# Demonstrates local + cloud hybrid setup with fallback logic.
+#
+# SETUP:
+# 1. Start local llama-server:
+#    llama-server --model path/to/qwen-7b.gguf --port 11211
+#
+# 2. Set cloud API keys:
+#    export OPENAI_API_KEY="sk-..."
+#    export ANTHROPIC_API_KEY="sk-ant-..."
+#
+# 3. Start Louter proxy:
+#    stack run louter-server -- --config multi-backend.yaml --port 9000
+#
+# USE CASES:
+# - Development: Use local models for testing (fast, free)
+# - Production: Use cloud APIs for reliability (high quality)
+# - Vision tasks: Route to vision-capable models automatically
+# - Cost optimization: Mix local and cloud based on requirements
+# ============================
+
+backends:
+  # Primary: Local llama-server (fast, free, no rate limits)
+  local-llama:
+    type: openai
+    url: http://localhost:11211
+    requires_auth: false
+
+    model_mapping:
+      # General text generation
+      gpt-3.5-turbo: qwen/qwen2.5-7b
+      claude-3-haiku: qwen/qwen2.5-7b
+
+      # Vision tasks
+      gpt-4-vision: qwen/qwen2.5-vl-7b
+      claude-3-sonnet: qwen/qwen2.5-vl-7b
+
+    max_tokens: 4096
+    temperature: 0.7
+    tool_format: json
+
+  # Secondary: OpenAI (high quality, reliable)
+  openai-cloud:
+    type: openai
+    url: https://api.openai.com
+    requires_auth: true
+    # api_key: "${OPENAI_API_KEY}"
+
+    model_mapping:
+      gpt-4: gpt-4-turbo-preview
+      gpt-4-turbo: gpt-4-turbo-preview
+      gpt-4o: gpt-4o
+
+    max_tokens: 4096
+    temperature: 0.7
+
+  # Tertiary: Anthropic (for Claude-specific features)
+  anthropic-cloud:
+    type: anthropic
+    url: https://api.anthropic.com
+    requires_auth: true
+    # api_key: "${ANTHROPIC_API_KEY}"
+
+    model_mapping:
+      claude-3-5-sonnet: claude-3-5-sonnet-20241022
+      claude-3-opus: claude-3-opus-20240229
+
+    max_tokens: 4096
+    temperature: 0.7
+
+  # Special: Qwen with XML tools (for specific tool-calling scenarios)
+  qwen-xml:
+    type: openai
+    url: http://localhost:11212
+    requires_auth: false
+
+    model_mapping:
+      qwen3-coder: Qwen3-Coder-30B-A3B-Instruct
+
+    max_tokens: 65536
+    temperature: 0.7
+    tool_format: xml  # Qwen uses XML format for function calling
+
+# Routing Strategy:
+# =================
+# 1. Model name determines backend
+# 2. If model not found, use first available backend
+# 3. Each backend is independent - no automatic failover
+#
+# Examples:
+# - model="gpt-3.5-turbo" -> local-llama (fast, free)
+# - model="gpt-4" -> openai-cloud (high quality)
+# - model="claude-3-5-sonnet" -> anthropic-cloud (Claude features)
+# - model="qwen3-coder" -> qwen-xml (XML tools)

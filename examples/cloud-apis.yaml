@@ -1,0 +1,103 @@
+# Cloud APIs Configuration
+# =========================
+# Configuration for using real cloud LLM APIs with authentication.
+# Supports OpenAI, Anthropic, and Google Gemini.
+#
+# SETUP:
+# 1. Get API keys:
+#    - OpenAI: https://platform.openai.com/api-keys
+#    - Anthropic: https://console.anthropic.com/settings/keys
+#    - Gemini: https://makersuite.google.com/app/apikey
+#
+# 2. Set environment variables (recommended):
+#    export OPENAI_API_KEY="sk-..."
+#    export ANTHROPIC_API_KEY="sk-ant-..."
+#    export GEMINI_API_KEY="..."
+#
+#    Or set directly in this file (not recommended for production):
+#    api_key: "sk-..."
+#
+# 3. Start Louter proxy:
+#    stack run louter-server -- --config cloud-apis.yaml --port 9000
+#
+# USAGE:
+# - Send any format request to localhost:9000
+# - Louter routes to appropriate backend based on model name
+# - Handles protocol conversion automatically
+# =========================
+
+backends:
+  # OpenAI API
+  openai:
+    type: openai
+    url: https://api.openai.com
+    requires_auth: true
+    # api_key: "${OPENAI_API_KEY}"  # Or set directly (not recommended)
+
+    model_mapping:
+      gpt-4: gpt-4-turbo-preview
+      gpt-4-turbo: gpt-4-turbo-preview
+      gpt-3.5-turbo: gpt-3.5-turbo
+      gpt-4o: gpt-4o
+      gpt-4o-mini: gpt-4o-mini
+
+    # Optional settings
+    max_tokens: 4096
+    temperature: 0.7
+
+  # Anthropic API (Claude)
+  anthropic:
+    type: anthropic
+    url: https://api.anthropic.com
+    requires_auth: true
+    # api_key: "${ANTHROPIC_API_KEY}"
+
+    model_mapping:
+      claude-3-5-sonnet-20241022: claude-3-5-sonnet-20241022
+      claude-3-opus-20240229: claude-3-opus-20240229
+      claude-3-sonnet-20240229: claude-3-sonnet-20240229
+      claude-3-haiku-20240307: claude-3-haiku-20240307
+
+    max_tokens: 4096
+    temperature: 0.7
+
+  # Google Gemini API
+  gemini:
+    type: gemini
+    url: https://generativelanguage.googleapis.com
+    requires_auth: true
+    # api_key: "${GEMINI_API_KEY}"
+
+    model_mapping:
+      gemini-2.0-flash: gemini-2.0-flash-exp
+      gemini-1.5-pro: gemini-1.5-pro-latest
+      gemini-1.5-flash: gemini-1.5-flash-latest
+      gemini-pro: gemini-pro
+
+    max_tokens: 8192
+    temperature: 0.7
+
+# Example Usage:
+# ==============
+#
+# Using OpenAI SDK with Claude:
+# ------------------------------
+# from openai import OpenAI
+# client = OpenAI(base_url="http://localhost:9000/v1", api_key="not-needed")
+# response = client.chat.completions.create(
+#     model="claude-3-5-sonnet-20241022",  # Routed to Anthropic
+#     messages=[{"role": "user", "content": "Hello!"}]
+# )
+#
+# Using Anthropic SDK with Gemini:
+# ---------------------------------
+# import anthropic
+# client = anthropic.Anthropic(
+#     api_key="not-needed",
+#     base_url="http://localhost:9000"
+# )
+# response = client.messages.create(
+#     model="gemini-2.0-flash",  # Routed to Gemini
+#     max_tokens=1024,
+#     messages=[{"role": "user", "content": "Hello!"}]
+# )

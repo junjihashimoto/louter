@@ -19,23 +19,20 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /build
 
 # Copy only cabal/stack files first for better caching
-COPY haskell/louter/package.yaml haskell/louter/stack.yaml* ./haskell/louter/
-COPY haskell/louter/louter.cabal ./haskell/louter/ 2>/dev/null || true
+COPY louter.cabal stack.yaml* ./
 
 # Pre-build dependencies (cached layer)
-WORKDIR /build/haskell/louter
 RUN stack build --only-dependencies --system-ghc 2>/dev/null || \
     stack setup && stack build --only-dependencies
 
 # Copy source code
-WORKDIR /build
-COPY haskell/louter ./haskell/louter
-COPY CLAUDE.md README.md INSTALLATION.md CONTRIBUTING.md ./
+COPY src ./src
+COPY app ./app
+COPY test ./test
 COPY docs ./docs
 COPY examples ./examples
 
 # Build application
-WORKDIR /build/haskell/louter
 RUN stack build --system-ghc --copy-bins --local-bin-path /build/bin
 
 # Stage 2: Runtime
@@ -85,7 +82,7 @@ CMD ["louter-server", "--config", "examples/local-llama-server.yaml", "--port", 
 # Build:
 # ------
 # docker build -t louter:latest .
-# docker build -t louter:0.5.0 .
+# docker build -t louter:0.1.0 .
 #
 # Run with default config (local llama-server):
 # ----------------------------------------------

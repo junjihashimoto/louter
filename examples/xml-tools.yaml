@@ -1,0 +1,166 @@
+# XML Tool Format Configuration
+# ==============================
+# Configuration for models that use XML format for function calling.
+# Specifically designed for Qwen models which output tool calls in XML.
+#
+# BACKGROUND:
+# While OpenAI, Anthropic, and Gemini use JSON for function calling,
+# some models (notably Qwen) use XML format:
+#
+# JSON format (standard):
+#   {"name": "get_weather", "arguments": {"location": "Tokyo"}}
+#
+# XML format (Qwen):
+#   <tool_call>
+#   <name>get_weather</name>
+#   <arguments>{"location": "Tokyo"}</arguments>
+#   </tool_call>
+#
+# Louter handles the conversion automatically when tool_format: xml is set.
+#
+# SETUP:
+# 1. Start Qwen model with llama-server:
+#    llama-server --model path/to/qwen2.5-7b-instruct.gguf --port 11211
+#
+# 2. Start Louter proxy:
+#    stack run louter-server -- --config xml-tools.yaml --port 9000
+#
+# 3. Test with any standard SDK (Louter converts to/from XML):
+#    curl http://localhost:9000/v1/chat/completions \
+#      -H "Content-Type: application/json" \
+#      -d '{
+#        "model": "qwen",
+#        "messages": [{"role": "user", "content": "What'\''s the weather in Tokyo?"}],
+#        "tools": [{
+#          "type": "function",
+#          "function": {
+#            "name": "get_weather",
+#            "description": "Get current weather",
+#            "parameters": {
+#              "type": "object",
+#              "properties": {"location": {"type": "string"}},
+#              "required": ["location"]
+#            }
+#          }
+#        }]
+#      }'
+# ==============================
+
+backends:
+  # Qwen with XML tool format
+  qwen-xml:
+    type: openai
+    url: http://localhost:11211
+    requires_auth: false
+    tool_format: xml  # Enable XML tool call parsing
+
+    model_mapping:
+      # Qwen models
+      qwen: qwen/qwen2.5-7b-instruct
+      qwen2.5: qwen/qwen2.5-7b-instruct
+      qwen2.5-coder: qwen/qwen2.5-coder-7b-instruct
+      qwen3-coder: Qwen3-Coder-30B-A3B-Instruct
+
+      # Map from other model names
+      gpt-4: qwen/qwen2.5-7b-instruct
+      claude-3-sonnet: qwen/qwen2.5-7b-instruct
+
+    max_tokens: 65536  # Qwen supports large context
+    temperature: 0.7
+
+  # Standard JSON tool format (for comparison)
+  gpt-oss-json:
+    type: openai
+    url: http://localhost:11212
+    requires_auth: false
+    tool_format: json  # Standard JSON format (default)
+
+    model_mapping:
+      gpt-oss: gpt-oss:20b
+
+    max_tokens: 4096
+    temperature: 0.7
+
+# How it works:
+# =============
+#
+# 1. Client sends standard OpenAI-format tool definition (JSON):
+#    {
+#      "tools": [{
+#        "type": "function",
+#        "function": {"name": "get_weather", "parameters": {...}}
+#      }]
+#    }
+#
+# 2. Louter converts to appropriate format for backend:
+#    - For xml backends: Converts to XML prompt format
+#    - For json backends: Passes through as-is
+#
+# 3. Backend responds with tool calls:
+#    - XML backend: <tool_call>...</tool_call>
+#    - JSON backend: {"tool_calls": [...]}
+#
+# 4. Louter converts back to standard JSON for client:
+#    {
+#      "choices": [{
+#        "message": {
+#          "tool_calls": [{
+#            "id": "call_123",
+#            "function": {"name": "get_weather", "arguments": "{...}"}
+#          }]
+#        }
+#      }]
+#    }
+#
+# Key Benefits:
+# =============
+# - Use any SDK (OpenAI, Anthropic, Gemini) with XML-format models
+# - No client-side code changes needed
+# - Automatic buffering and parsing of XML during streaming
+# - Proper error handling for malformed XML
+#
+# XML Parsing Details:
+# ====================
+# During streaming, Louter buffers XML content:
+#
+# Stream chunk 1: "Let me check the weather. <tool"
+# Stream chunk 2: "_call>\n<name>get_weather</n"
+# Stream chunk 3: "ame>\n<arguments>{\"location\": \"T"
+# Stream chunk 4: "okyo\"}</arguments>\n</tool_call>"
+#
+# Louter detects <tool_call> start, buffers until </tool_call>,
+# then parses and emits complete JSON tool call to client.
+
+# Example Usage:
+# ==============
+#
+# Python (OpenAI SDK):
+# --------------------
+# from openai import OpenAI
+#
+# client = OpenAI(base_url="http://localhost:9000/v1", api_key="not-needed")
+#
+# tools = [{
+#     "type": "function",
+#     "function": {
+#         "name": "get_weather",
+#         "description": "Get current weather",
+#         "parameters": {
+#             "type": "object",
+#             "properties": {"location": {"type": "string"}},
+#             "required": ["location"]
+#         }
+#     }
+# }]
+#
+# response = client.chat.completions.create(
+#     model="qwen",  # Routed to XML backend
+#     messages=[{"role": "user", "content": "Weather in Tokyo?"}],
+#     tools=tools
+# )
+#
+# # Response is standard JSON format, even though backend used XML
+# if response.choices[0].message.tool_calls:
+#     for call in response.choices[0].message.tool_calls:
+#         print(f"Tool: {call.function.name}")
+#         print(f"Args: {call.function.arguments}")

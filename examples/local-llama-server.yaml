@@ -1,0 +1,47 @@
+# Local llama-server Configuration
+# ==================================
+# Simple configuration for running Louter with a local llama-server instance.
+# No authentication required.
+#
+# SETUP:
+# 1. Start llama-server:
+#    llama-server --model path/to/model.gguf --port 11211
+#
+# 2. Start Louter proxy:
+#    stack run louter-server -- --config local-llama-server.yaml --port 9000
+#
+# 3. Test with curl:
+#    curl http://localhost:9000/v1/chat/completions \
+#      -H "Content-Type: application/json" \
+#      -d '{"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}'
+#
+# USAGE:
+# - Send OpenAI, Anthropic, or Gemini format requests to localhost:9000
+# - Louter converts to OpenAI format and forwards to llama-server
+# - Supports streaming, function calling, and vision (if model supports it)
+# ==================================
+
+# Backend configuration
+backends:
+  llama-server:
+    type: openai
+    url: http://localhost:11211
+    requires_auth: false  # Local server, no API key needed
+
+    # Model mappings: frontend model -> backend model
+    model_mapping:
+      # Map popular model names to your local model
+      gpt-4: qwen/qwen2.5-vl-7b
+      gpt-3.5-turbo: qwen/qwen2.5-7b
+      claude-3-5-sonnet-20241022: qwen/qwen2.5-vl-7b
+      gemini-2.0-flash: qwen/qwen2.5-vl-7b
+
+      # Or use the actual model name
+      gpt-oss: gpt-oss:20b
+
+    # Optional: Tool calling format (json or xml)
+    # tool_format: json  # Default is json
+
+    # Optional: Request parameters
+    # max_tokens: 4096
+    # temperature: 0.7

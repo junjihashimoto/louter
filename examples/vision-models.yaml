@@ -1,0 +1,155 @@
+# Vision Models Configuration
+# ============================
+# Configuration for multimodal models that support vision (image analysis).
+# Demonstrates proper setup for image-capable backends.
+#
+# SETUP:
+# 1. For local vision models:
+#    llama-server --model path/to/qwen2.5-vl-7b.gguf --port 11211 --mlock
+#
+# 2. For cloud APIs (with vision support):
+#    export OPENAI_API_KEY="sk-..."
+#    export GEMINI_API_KEY="..."
+#    export ANTHROPIC_API_KEY="sk-ant-..."
+#
+# 3. Start Louter proxy:
+#    stack run louter-server -- --config vision-models.yaml --port 9000
+#
+# SUPPORTED IMAGE FORMATS:
+# - Data URLs: data:image/png;base64,iVBORw0KGgo...
+# - HTTP(S) URLs: https://example.com/image.jpg
+# - Base64 encoded images with media type
+#
+# EXAMPLE REQUEST:
+# {
+#   "model": "gpt-4-vision",
+#   "messages": [
+#     {
+#       "role": "user",
+#       "content": [
+#         {"type": "text", "text": "What's in this image?"},
+#         {
+#           "type": "image_url",
+#           "image_url": {
+#             "url": "data:image/png;base64,iVBORw0KGgo..."
+#           }
+#         }
+#       ]
+#     }
+#   ]
+# }
+# ============================
+
+backends:
+  # Local Vision Model (Qwen2.5-VL)
+  local-vision:
+    type: openai
+    url: http://localhost:11211
+    requires_auth: false
+
+    model_mapping:
+      # Vision-capable models
+      gpt-4-vision: qwen/qwen2.5-vl-7b
+      gpt-4-vision-preview: qwen/qwen2.5-vl-7b
+      gpt-4o: qwen/qwen2.5-vl-7b
+      claude-3-sonnet: qwen/qwen2.5-vl-7b
+      gemini-pro-vision: qwen/qwen2.5-vl-7b
+
+    max_tokens: 4096
+    temperature: 0.7
+
+    # Vision-specific settings (optional)
+    # vision:
+    #   max_image_size: 2048  # Max dimension in pixels
+    #   supported_formats: [png, jpg, jpeg, webp]
+
+  # OpenAI Vision (GPT-4 Vision, GPT-4o)
+  openai-vision:
+    type: openai
+    url: https://api.openai.com
+    requires_auth: true
+    # api_key: "${OPENAI_API_KEY}"
+
+    model_mapping:
+      gpt-4-vision-preview: gpt-4-vision-preview
+      gpt-4o: gpt-4o
+      gpt-4o-mini: gpt-4o-mini
+
+    max_tokens: 4096
+    temperature: 0.7
+
+  # Anthropic Vision (Claude 3)
+  anthropic-vision:
+    type: anthropic
+    url: https://api.anthropic.com
+    requires_auth: true
+    # api_key: "${ANTHROPIC_API_KEY}"
+
+    model_mapping:
+      claude-3-5-sonnet: claude-3-5-sonnet-20241022
+      claude-3-opus: claude-3-opus-20240229
+      claude-3-sonnet: claude-3-sonnet-20240229
+
+    max_tokens: 4096
+    temperature: 0.7
+
+  # Google Gemini Vision (Gemini Pro Vision)
+  gemini-vision:
+    type: gemini
+    url: https://generativelanguage.googleapis.com
+    requires_auth: true
+    # api_key: "${GEMINI_API_KEY}"
+
+    model_mapping:
+      gemini-2.0-flash: gemini-2.0-flash-exp
+      gemini-1.5-pro: gemini-1.5-pro-latest
+      gemini-pro-vision: gemini-1.5-pro-latest
+
+    max_tokens: 8192
+    temperature: 0.7
+
+# Usage Examples:
+# ===============
+#
+# Python (OpenAI SDK):
+# --------------------
+# from openai import OpenAI
+# import base64
+#
+# client = OpenAI(base_url="http://localhost:9000/v1", api_key="not-needed")
+#
+# # Read image as base64
+# with open("image.jpg", "rb") as f:
+#     image_data = base64.b64encode(f.read()).decode()
+#
+# response = client.chat.completions.create(
+#     model="gpt-4-vision",
+#     messages=[{
+#         "role": "user",
+#         "content": [
+#             {"type": "text", "text": "Describe this image"},
+#             {"type": "image_url", "image_url": {
+#                 "url": f"data:image/jpeg;base64,{image_data}"
+#             }}
+#         ]
+#     }]
+# )
+#
+# Haskell (Louter Client Library):
+# ---------------------------------
+# import Louter.Client
+# import Louter.Client.OpenAI (llamaServerClient)
+# import Data.Aeson (object, (.=))
+#
+# main = do
+#   client <- llamaServerClient "http://localhost:9000"
+#   let imageContent = ContentPart
+#         { partType = ImagePart
+#         , imageMediaType = "image/jpeg"
+#         , imageData = "iVBORw0KGgo..."  -- base64
+#         }
+#   let request = (defaultChatRequest "gpt-4-vision"
+#         [ Message RoleUser [TextPart "What's in this image?", imageContent] ])
+#         { reqMaxTokens = Just 1000 }
+#   response <- chatCompletion client request
+#   print response

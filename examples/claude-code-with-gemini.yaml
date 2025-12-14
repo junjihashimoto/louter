@@ -1,0 +1,121 @@
+# Claude Code with Gemini Backend
+# =================================
+# Configuration to use Claude Code (or other Anthropic-compatible clients)
+# with Google Gemini as the backend LLM.
+#
+# USE CASE:
+# - Use Claude Code's excellent developer experience
+# - Pay Gemini API rates instead of Claude API rates
+# - Access Gemini's features (large context, multimodal, etc.)
+#
+# SETUP:
+# 1. Get Gemini API key:
+#    https://makersuite.google.com/app/apikey
+#
+# 2. Set environment variable:
+#    export GEMINI_API_KEY="your-api-key"
+#
+# 3. Start Louter proxy on Anthropic-compatible port:
+#    stack run louter-server -- --config claude-code-with-gemini.yaml --port 8000
+#
+# 4. Configure Claude Code:
+#    In Claude Code settings:
+#    - API Endpoint: http://localhost:8000
+#    - API Key: (leave empty or use "not-needed")
+#    - Model: claude-3-5-sonnet-20241022
+#
+# 5. Use Claude Code normally!
+#    All requests will be routed to Gemini.
+#
+# HOW IT WORKS:
+# - Claude Code sends Anthropic API format requests
+# - Louter converts to Gemini API format
+# - Gemini processes the request
+# - Louter converts response back to Anthropic format
+# - Claude Code receives standard Anthropic response
+# =================================
+
+backends:
+  # Google Gemini as Claude backend
+  gemini:
+    type: gemini
+    url: https://generativelanguage.googleapis.com
+    requires_auth: true
+    # api_key: "${GEMINI_API_KEY}"  # Set via environment variable
+
+    model_mapping:
+      # Map Claude model names to Gemini models
+      claude-3-5-sonnet-20241022: gemini-2.0-flash-exp
+      claude-3-opus-20240229: gemini-1.5-pro-latest
+      claude-3-sonnet-20240229: gemini-1.5-flash-latest
+      claude-3-haiku-20240307: gemini-1.5-flash-latest
+
+      # Generic mappings
+      claude-3-5-sonnet: gemini-2.0-flash-exp
+      claude-3-opus: gemini-1.5-pro-latest
+      claude-3-sonnet: gemini-1.5-flash-latest
+      claude-3-haiku: gemini-1.5-flash-latest
+
+    max_tokens: 8192
+    temperature: 0.7
+
+# Alternative: Use local model instead of Gemini
+# ===============================================
+# Uncomment this section to use a local llama-server instead:
+#
+# backends:
+#   local-llama:
+#     type: openai
+#     url: http://localhost:11211
+#     requires_auth: false
+#
+#     model_mapping:
+#       claude-3-5-sonnet-20241022: qwen/qwen2.5-vl-7b
+#       claude-3-opus-20240229: qwen/qwen2.5-vl-7b
+#       claude-3-sonnet-20240229: qwen/qwen2.5-7b
+#       claude-3-haiku-20240307: qwen/qwen2.5-7b
+#
+#     max_tokens: 4096
+#     temperature: 0.7
+
+# Features Supported:
+# ===================
+# ✅ Text generation
+# ✅ Streaming responses
+# ✅ Function calling / tool use
+# ✅ Vision (multimodal images)
+# ✅ System prompts
+# ✅ Multi-turn conversations
+# ✅ Stop sequences
+# ✅ Temperature and max_tokens
+#
+# ⚠️  Note: Some Claude-specific features may not translate perfectly:
+# - Thinking blocks (Claude's extended thinking mode)
+# - Prefill (Claude's prompt prefilling)
+# - Some advanced tool use patterns
+#
+# These will be handled gracefully with best-effort conversion.
+
+# Troubleshooting:
+# ================
+#
+# Issue: Claude Code can't connect
+# Solution: Make sure proxy is running on port 8000:
+#   stack run louter-server -- --config claude-code-with-gemini.yaml --port 8000
+#
+# Issue: "Invalid API key" error
+# Solution: Check GEMINI_API_KEY environment variable:
+#   echo $GEMINI_API_KEY
+#
+# Issue: Responses seem wrong or incomplete
+# Solution: Check logs in terminal where proxy is running.
+#   Look for conversion errors or API errors.
+#
+# Issue: Tool calling doesn't work
+# Solution: Gemini uses different tool call format. Check logs for
+#   conversion details. Some complex tool schemas may need adjustment.
+#
+# Debug mode:
+# -----------
+# Add --verbose flag when starting proxy:
+#   stack run louter-server -- --config claude-code-with-gemini.yaml --port 8000 --verbose
