@@ -19,7 +19,7 @@ Multi-protocol LLM proxy and Haskell client library. Connect to any LLM API (Ope
 # Install
 git clone https://github.com/junjihashimoto/louter.git
 cd louter
-stack build
+cabal build all
 
 # Configure
 cat > config.yaml <<EOF
@@ -33,7 +33,7 @@ backends:
 EOF
 
 # Run
-stack run louter-server -- --config config.yaml --port 9000
+cabal run louter-server -- --config config.yaml --port 9000
 ```
 
 Now send OpenAI/Anthropic/Gemini requests to `localhost:9000`.
@@ -254,7 +254,7 @@ docker-compose up
 python tests/run_all_tests.py
 
 # Haskell unit tests
-stack test
+cabal test all
 ```
 
 ## Architecture
@@ -315,7 +315,7 @@ backends:
 
 ```bash
 # Start proxy on Anthropic-compatible port
-stack run louter-server -- --config config.yaml --port 8000
+cabal run louter-server -- --config config.yaml --port 8000
 
 # Configure Claude Code:
 # API Endpoint: http://localhost:8000
@@ -331,7 +331,7 @@ curl http://localhost:9000/health
 
 **JSON-line logging:**
 ```bash
-stack run louter-server -- --config config.yaml --port 9000 2>&1 | jq .
+cabal run louter-server -- --config config.yaml --port 9000 2>&1 | jq .
 ```
 
 ## Troubleshooting
