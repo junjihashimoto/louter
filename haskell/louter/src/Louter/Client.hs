@@ -48,6 +48,7 @@ import qualified Data.Conduit.List as CL
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import qualified Data.Vector as V
 import Network.HTTP.Client
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types (hContentType, hAuthorization)
@@ -98,7 +99,7 @@ chatCompletion client req = do
   case result of
     Left err -> pure $ Left err
     Right respBody ->
-      case eitherDecode respBody of
+      case parseBackendResponse (clientBackend client) respBody of
         Left err -> pure $ Left $ "Failed to parse response: " <> T.pack err
         Right resp -> pure $ Right resp
 
@@ -227,6 +228,78 @@ convertRequestToBackend backend chatReq =
                     else []
 
       Right (url, requestBody, headers)
+
+-- | Parse backend response into ChatResponse
+parseBackendResponse :: Backend -> BL.ByteString -> Either String ChatResponse
+parseBackendResponse backend respBody =
+  case backend of
+    BackendOpenAI{..} -> parseOpenAIResponse respBody
+    BackendAnthropic{..} -> parseAnthropicResponse respBody
+    BackendGemini{..} -> parseGeminiResponse respBody
+
+-- | Parse OpenAI format response
+parseOpenAIResponse :: BL.ByteString -> Either String ChatResponse
+parseOpenAIResponse body = do
+  obj <- eitherDecode body
+  case obj of
+    Object o -> do
+      respId <- case HM.lookup "id" o of
+        Just (String i) -> Right i
+        _ -> Right "unknown"
+
+      respModel <- case HM.lookup "model" o of
+        Just (String m) -> Right m
+        _ -> Right "unknown"
+
+      choices <- case HM.lookup "choices" o of
+        Just (Array cs) -> Right $ V.toList cs
+        _ -> Left "Missing choices"
+
+      parsedChoices <- mapM parseOpenAIChoice choices
+
+      pure $ ChatResponse respId respModel parsedChoices Nothing
+
+    _ -> Left "Expected object"
+
+parseOpenAIChoice :: Value -> Either String Choice
+parseOpenAIChoice (Object choice) = do
+  index <- case HM.lookup "index" choice of
+    Just (Number n) -> Right (floor n)
+    _ -> Right 0
+
+  message <- case HM.lookup "message" choice of
+    Just (Object msg) -> case HM.lookup "content" msg of
+      Just (String txt) -> Right txt
+      _ -> Right ""
+    _ -> Right ""
+
+  let finishReason = case HM.lookup "finish_reason" choice of
+        Just (String "stop") -> Just FinishStop
+        Just (String "length") -> Just FinishLength
+        Just (String "tool_calls") -> Just FinishToolCalls
+        _ -> Nothing
+
+  pure $ Choice index message finishReason
+
+parseOpenAIChoice _ = Left "Expected choice object"
+
+-- | Parse Anthropic format response (uses converter)
+parseAnthropicResponse :: BL.ByteString -> Either String ChatResponse
+parseAnthropicResponse body = do
+  obj <- eitherDecode body
+  -- Use anthropicToOpenAI converter, then parse as OpenAI
+  case anthropicToOpenAI obj of
+    Left err -> Left (T.unpack err)
+    Right openAIFormat -> parseOpenAIResponse (encode openAIFormat)
+
+-- | Parse Gemini format response (uses converter)
+parseGeminiResponse :: BL.ByteString -> Either String ChatResponse
+parseGeminiResponse body = do
+  obj <- eitherDecode body
+  -- Use geminiToOpenAI converter, then parse as OpenAI
+  case geminiToOpenAI "unknown" False obj of  -- False = non-streaming
+    Left err -> Left (T.unpack err)
+    Right openAIFormat -> parseOpenAIResponse (encode openAIFormat)
 
 -- Helper conversions for Anthropic
 chatMessageToAnthropic :: Message -> Value
