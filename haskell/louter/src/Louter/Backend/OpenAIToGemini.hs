@@ -17,6 +17,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.ByteString.Builder (Builder, byteString)
 import Data.Text (Text)
+import qualified Data.Text as T
 import qualified Data.Vector as V
 import qualified Network.HTTP.Client as HTTP
 import Network.HTTP.Client (brRead)
@@ -59,10 +60,52 @@ openAIMessageToGemini (Object msg) =
         Just (String "assistant") -> "model"
         Just (String r) -> r
         _ -> "user"
-      content = case HM.lookup "content" msg of
-        Just (String c) -> c
-        _ -> ""
-      parts = [object ["text" .= content]]
+
+      parts = case HM.lookup "content" msg of
+        -- Simple string content
+        Just (String c) -> [object ["text" .= c]]
+
+        -- Array of content parts (multimodal: text + images)
+        Just (Array contentParts) ->
+          map convertPart (V.toList contentParts)
+
+        _ -> [object ["text" .= ("" :: Text)]]
+
+      convertPart (Object part) = case HM.lookup "type" part of
+        -- Text part: {"type": "text", "text": "..."}
+        Just (String "text") -> case HM.lookup "text" part of
+          Just (String txt) -> object ["text" .= txt]
+          _ -> object []
+
+        -- Image part: {"type": "image_url", "image_url": {"url": "data:..."}}
+        Just (String "image_url") -> case HM.lookup "image_url" part of
+          Just (Object imgUrlObj) -> case HM.lookup "url" imgUrlObj of
+            Just (String dataUrl) ->
+              -- Parse data URL: "data:image/png;base64,..."
+              let (mediaType, base64Data) = parseDataUrl dataUrl
+              in object
+                  [ "inlineData" .= object
+                      [ "mimeType" .= mediaType
+                      , "data" .= base64Data
+                      ]
+                  ]
+            _ -> object []
+          _ -> object []
+
+        _ -> object []
+      convertPart _ = object []
+
+      -- Parse data URL: "data:image/png;base64,iVBORw0..." → ("image/png", "iVBORw0...")
+      parseDataUrl :: Text -> (Text, Text)
+      parseDataUrl url =
+        case T.stripPrefix "data:" url of
+          Just rest -> case T.breakOn ";base64," rest of
+            (mediaType, base64Part) -> case T.stripPrefix ";base64," base64Part of
+              Just base64Data -> (mediaType, base64Data)
+              Nothing -> ("image/png", "")
+            _ -> ("image/png", "")
+          Nothing -> ("image/png", "")
+
   in object ["role" .= role, "parts" .= parts]
 openAIMessageToGemini other = other
 

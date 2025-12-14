@@ -99,18 +99,56 @@ convertGeminiContentToMessage (Object content) = do
         (msg:_) -> Right msg
         [] -> Left "Function response part missing required fields"
     else do
-      -- Regular text content
-      let textContent = case parts of
-            (Object part : _) -> case HM.lookup "text" part of
-              Just (String txt) -> txt
-              _ -> ""
-            _ -> ""
+      -- Regular text/image content - convert to OpenAI format
+      let convertedParts = map convertPart parts
+          convertPart (Object part)
+            -- Text part: {"text": "..."}
+            | Just (String txt) <- HM.lookup "text" part =
+                object ["type" .= ("text" :: Text), "text" .= txt]
 
-      Right $ object
-        [ "role" .= openAIRole
-        , "content" .= textContent
-        ]
+            -- Image part: {"inlineData": {"mimeType": "...", "data": "..."}}
+            | Just (Object inlineData) <- HM.lookup "inlineData" part =
+                let mimeType = case HM.lookup "mimeType" inlineData of
+                      Just (String mt) -> mt
+                      _ -> "image/png"
+                    imageData = case HM.lookup "data" inlineData of
+                      Just (String dat) -> dat
+                      _ -> ""
+                    dataUrl = "data:" <> mimeType <> ";base64," <> imageData
+                in object
+                    [ "type" .= ("image_url" :: Text)
+                    , "image_url" .= object ["url" .= dataUrl]
+                    ]
+
+            -- Unknown part type
+            | otherwise = object []
+          convertPart _ = object []
+
+      Right $ case convertedParts of
+        -- Single text part - simplify to string
+        [part] | isSimpleText part -> object
+          [ "role" .= openAIRole
+          , "content" .= extractText part
+          ]
+        -- Multiple parts or has images - use array format
+        _ -> object
+          [ "role" .= openAIRole
+          , "content" .= filter (not . isEmptyObject) convertedParts
+          ]
   where
+    -- Helper functions for vision content
+    isSimpleText (Object obj) = HM.lookup "type" obj == Just (String "text")
+    isSimpleText _ = False
+
+    extractText (Object obj) = case HM.lookup "text" obj of
+      Just (String txt) -> txt
+      _ -> ""
+    extractText _ = ""
+
+    isEmptyObject (Object obj) = HM.null obj
+    isEmptyObject _ = False
+
+    -- Helper functions for function responses
     isFunctionResponse (Object part) = HM.member "functionResponse" part
     isFunctionResponse _ = False
 

@@ -17,6 +17,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.ByteString.Builder (Builder, byteString)
 import Data.Text (Text)
+import qualified Data.Text as T
 import qualified Data.Vector as V
 import qualified Network.HTTP.Client as HTTP
 import Network.HTTP.Client (brRead)
@@ -59,10 +60,56 @@ openAIMessageToAnthropic (Object msg) =
   let role = case HM.lookup "role" msg of
         Just (String r) -> r
         _ -> "user"
+
       content = case HM.lookup "content" msg of
-        Just (String c) -> c
-        _ -> ""
+        -- Simple string content
+        Just (String c) -> String c
+
+        -- Array of content parts (multimodal: text + images)
+        Just (Array parts) ->
+          let convertedParts = map convertPart (V.toList parts)
+              convertPart (Object part) = case HM.lookup "type" part of
+                -- Text part: {"type": "text", "text": "..."}
+                Just (String "text") -> case HM.lookup "text" part of
+                  Just (String txt) -> object ["type" .= ("text" :: Text), "text" .= txt]
+                  _ -> object []
+
+                -- Image part: {"type": "image_url", "image_url": {"url": "data:..."}}
+                Just (String "image_url") -> case HM.lookup "image_url" part of
+                  Just (Object imgUrlObj) -> case HM.lookup "url" imgUrlObj of
+                    Just (String dataUrl) ->
+                      -- Parse data URL: "data:image/png;base64,..."
+                      let (mediaType, base64Data) = parseDataUrl dataUrl
+                      in object
+                          [ "type" .= ("image" :: Text)
+                          , "source" .= object
+                              [ "type" .= ("base64" :: Text)
+                              , "media_type" .= mediaType
+                              , "data" .= base64Data
+                              ]
+                          ]
+                    _ -> object []
+                  _ -> object []
+
+                _ -> object []
+              convertPart _ = object []
+          in Array (V.fromList convertedParts)
+
+        _ -> String ""
+
   in object ["role" .= role, "content" .= content]
+  where
+    -- Parse data URL: "data:image/png;base64,iVBORw0..." → ("image/png", "iVBORw0...")
+    parseDataUrl :: Text -> (Text, Text)
+    parseDataUrl url =
+      case T.stripPrefix "data:" url of
+        Just rest -> case T.breakOn ";base64," rest of
+          (mediaType, base64Part) -> case T.stripPrefix ";base64," base64Part of
+            Just base64Data -> (mediaType, base64Data)
+            Nothing -> ("image/png", "")  -- Fallback
+          _ -> ("image/png", "")
+        Nothing -> ("image/png", "")
+
 openAIMessageToAnthropic other = other
 
 -- | Convert Anthropic response to OpenAI response format
