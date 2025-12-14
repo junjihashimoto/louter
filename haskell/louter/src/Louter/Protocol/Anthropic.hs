@@ -17,6 +17,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Vector as V
+import Debug.Trace (trace)
 import Louter.Types
 import Louter.Types.Streaming
 
@@ -73,22 +74,40 @@ parseAnthropicMessage (Object obj) = do
     _ -> Left "Missing 'role' field"
 
   content <- case KM.lookup "content" obj of
-    Just (String txt) -> Right txt
-    Just (Array parts) -> extractTextFromAnthropicContent (V.toList parts)
+    Just (String txt) -> Right [TextPart txt]
+    Just (Array parts) -> anthropicContentPartsToIR (V.toList parts)
     _ -> Left "Missing or invalid 'content' field"
 
   pure $ Message role content
 parseAnthropicMessage _ = Left "Expected JSON object for message"
 
--- | Extract text from Anthropic content array
-extractTextFromAnthropicContent :: [Value] -> Either Text Text
-extractTextFromAnthropicContent parts =
-  let texts = [txt | Object part <- parts
-                    , Just (String "text") <- [KM.lookup "type" part]
-                    , Just (String txt) <- [KM.lookup "text" part]]
-  in if null texts
-       then Left "No text found in content"
-       else Right $ T.intercalate " " texts
+-- | Convert Anthropic content parts to IR ContentPart list
+anthropicContentPartsToIR :: [Value] -> Either Text [ContentPart]
+anthropicContentPartsToIR parts = do
+  result <- mapM convertPart parts
+  let msg = "[Anthropic] Parsed " ++ show (length result) ++ " content parts: " ++ show (map partType result)
+      partType (TextPart _) = "text"
+      partType (ImagePart _ _) = "image"
+  trace msg $ pure result
+  where
+    convertPart (Object part) = case KM.lookup "type" part of
+      Just (String "text") -> case KM.lookup "text" part of
+        Just (String txt) -> Right $ TextPart txt
+        _ -> Left "Missing 'text' field in text part"
+
+      Just (String "image") -> case KM.lookup "source" part of
+        Just (Object source) -> do
+          mediaType <- case KM.lookup "media_type" source of
+            Just (String mt) -> Right mt
+            _ -> Left "Missing 'media_type' in image source"
+          imageData <- case KM.lookup "data" source of
+            Just (String dat) -> Right dat
+            _ -> Left "Missing 'data' in image source"
+          Right $ ImagePart mediaType imageData
+        _ -> Left "Missing or invalid 'source' in image part"
+
+      _ -> Left "Unknown content part type"
+    convertPart _ = Left "Expected object for content part"
 
 -- | Convert Anthropic tool to IR Tool
 anthropicToolToIR :: Value -> Either Text Tool

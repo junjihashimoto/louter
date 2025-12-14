@@ -108,10 +108,39 @@ convertAnthropicMessageToOpenAI (Object msg) =
         else if hasToolUse
           then convertAnthropicToolUseToOpenAI role contentBlocks
         else
-          -- Regular text blocks
-          let textContent = T.concat [txt | Object block <- contentBlocks,
-                                            Just (String txt) <- [HM.lookup "text" block]]
-          in object ["role" .= role, "content" .= textContent]
+          -- Regular text/image blocks - convert to OpenAI format
+          let convertedContent = map convertContentBlock contentBlocks
+              convertContentBlock (Object block) =
+                case HM.lookup "type" block of
+                  Just (String "text") -> case HM.lookup "text" block of
+                    Just (String txt) -> object ["type" .= ("text" :: Text), "text" .= txt]
+                    _ -> object []
+                  Just (String "image") -> case HM.lookup "source" block of
+                    Just (Object source) ->
+                      let mediaType = case HM.lookup "media_type" source of
+                            Just (String mt) -> mt
+                            _ -> "image/png"
+                          imageData = case HM.lookup "data" source of
+                            Just (String dat) -> dat
+                            _ -> ""
+                          dataUrl = "data:" <> mediaType <> ";base64," <> imageData
+                      in object
+                          [ "type" .= ("image_url" :: Text)
+                          , "image_url" .= object ["url" .= dataUrl]
+                          ]
+                    _ -> object []
+                  _ -> object []
+              convertContentBlock _ = object []
+          in if length convertedContent == 1 && isSimpleText (head convertedContent)
+               then object ["role" .= role, "content" .= extractText (head convertedContent)]
+               else object ["role" .= role, "content" .= convertedContent]
+          where
+            isSimpleText (Object obj) = HM.lookup "type" obj == Just (String "text")
+            isSimpleText _ = False
+            extractText (Object obj) = case HM.lookup "text" obj of
+              Just (String txt) -> txt
+              _ -> ""
+            extractText _ = ""
 
     _ -> object ["role" .= role, "content" .= content]
 

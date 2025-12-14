@@ -39,7 +39,7 @@ import Text.Printf (printf)
 
 import Louter.Client (Client, Backend(..), newClient, chatCompletion, streamChat)
 import Louter.Client.OpenAI (llamaServerClient)
-import Louter.Types.Request (ChatRequest(..), Message(..), MessageRole(..), Tool(..), ToolChoice(..))
+import Louter.Types.Request (ChatRequest(..), Message(..), MessageRole(..), ContentPart(..), Tool(..), ToolChoice(..))
 import Louter.Types.Streaming (StreamEvent(..))
 import Louter.Types.ToolFormat (XMLToolCallState, initialXMLState)
 import Louter.Protocol.AnthropicConverter
@@ -611,7 +611,7 @@ parseMessages = mapM parseMessage
         _ -> Left "Invalid or missing 'role' field"
 
       content <- case HM.lookup "content" obj of
-        Just (String c) -> Right c
+        Just (String c) -> Right [TextPart c]
         _ -> Left "Invalid or missing 'content' field"
 
       Right Message { msgRole = role, msgContent = content }

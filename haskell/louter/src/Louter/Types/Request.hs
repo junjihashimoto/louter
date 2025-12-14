@@ -7,6 +7,7 @@ module Louter.Types.Request
   ( ChatRequest(..)
   , Message(..)
   , MessageRole(..)
+  , ContentPart(..)
   , Tool(..)
   , ToolChoice(..)
   , defaultChatRequest
@@ -15,6 +16,7 @@ module Louter.Types.Request
 import Data.Aeson (FromJSON(..), ToJSON(..), Value(..), (.=), object)
 import Data.Aeson.KeyMap (lookup)
 import Data.Text (Text)
+import qualified Data.Vector as V
 import GHC.Generics (Generic)
 import Prelude hiding (lookup)
 
@@ -45,14 +47,66 @@ defaultChatRequest model msgs = ChatRequest
   , reqStream = False
   }
 
+-- | Content part (text, image, etc.)
+data ContentPart
+  = TextPart !Text
+  | ImagePart
+      { imageMediaType :: !Text  -- ^ MIME type (e.g., "image/png")
+      , imageData :: !Text       -- ^ Base64-encoded image data
+      }
+  deriving (Show, Eq, Generic)
+
+instance ToJSON ContentPart where
+  toJSON (TextPart txt) = object
+    [ "type" .= ("text" :: Text)
+    , "text" .= txt
+    ]
+  toJSON (ImagePart mediaType dataB64) = object
+    [ "type" .= ("image_url" :: Text)
+    , "image_url" .= object
+        [ "url" .= ("data:" <> mediaType <> ";base64," <> dataB64)
+        ]
+    ]
+
+instance FromJSON ContentPart where
+  parseJSON (Object obj) = case lookup "type" obj of
+    Just (String "text") -> case lookup "text" obj of
+      Just (String txt) -> pure $ TextPart txt
+      _ -> fail "Missing text field"
+    Just (String "image_url") -> case lookup "image_url" obj of
+      Just (Object imgObj) -> case lookup "url" imgObj of
+        Just (String url) -> pure $ TextPart url  -- Simplified for now
+        _ -> fail "Missing url in image_url"
+      _ -> fail "Missing image_url object"
+    _ -> fail "Unknown content part type"
+  parseJSON _ = fail "Expected object for ContentPart"
+
 -- | Message in a conversation
 data Message = Message
   { msgRole :: !MessageRole
-  , msgContent :: !Text
+  , msgContent :: ![ContentPart]  -- ^ Changed from Text to [ContentPart]
   } deriving (Show, Eq, Generic)
 
-instance FromJSON Message
-instance ToJSON Message
+instance FromJSON Message where
+  parseJSON (Object obj) = do
+    role <- case lookup "role" obj of
+      Just r -> parseJSON r
+      Nothing -> fail "Missing role"
+    content <- case lookup "content" obj of
+      -- Support both string and array format
+      Just (String txt) -> pure [TextPart txt]
+      Just (Array arr) -> mapM parseJSON (V.toList arr)
+      _ -> fail "Missing or invalid content"
+    pure $ Message role content
+  parseJSON _ = fail "Expected object for Message"
+
+instance ToJSON Message where
+  toJSON (Message role content) = object
+    [ "role" .= role
+    , "content" .= case content of
+        [TextPart txt] -> String txt  -- Simplify single text to string
+        parts -> toJSON parts         -- Multiple parts as array
+    ]
 
 -- | Message role
 data MessageRole

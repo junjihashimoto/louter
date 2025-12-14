@@ -213,13 +213,18 @@ printMessage msg = do
         RoleAssistant -> "Assistant"
         RoleSystem -> "System"
         RoleTool -> "Tool"
-  TIO.putStrLn $ roleStr <> ": " <> msgContent msg
+      content = contentPartsToText (msgContent msg)
+  TIO.putStrLn $ roleStr <> ": " <> content
+
+-- | Convert ContentPart list to Text (for display)
+contentPartsToText :: [ContentPart] -> Text
+contentPartsToText parts = T.intercalate " " [txt | TextPart txt <- parts]
 
 -- | Handle a chat message
 handleMessage :: Text -> CLIState -> IO CLIState
 handleMessage userInput state@CLIState{..} = do
   let CLIConfig{..} = stateConfig
-      userMessage = Message RoleUser userInput
+      userMessage = Message RoleUser [TextPart userInput]
       newHistory = stateHistory ++ [userMessage]
 
       -- Build tools list from MCP tools
@@ -244,7 +249,7 @@ handleMessage userInput state@CLIState{..} = do
       -- Streaming response
       assistantContent <- handleStreamingResponse stateClient request
       TIO.putStrLn ""  -- Newline after streaming
-      let assistantMessage = Message RoleAssistant assistantContent
+      let assistantMessage = Message RoleAssistant [TextPart assistantContent]
       pure state { stateHistory = newHistory ++ [assistantMessage] }
     else do
       -- Non-streaming response
@@ -258,7 +263,7 @@ handleMessage userInput state@CLIState{..} = do
                 (choice:_) -> choiceMessage choice
                 [] -> ""
           TIO.putStrLn content
-          let assistantMessage = Message RoleAssistant content
+          let assistantMessage = Message RoleAssistant [TextPart content]
           pure state { stateHistory = newHistory ++ [assistantMessage] }
 
 -- | Handle streaming response
