@@ -2,6 +2,16 @@
 """
 Unit tests for Gemini API streaming implementation using official SDK.
 
+STREAMING FORMAT: JSON Array (alt=json)
+This test uses Gemini's JSON array streaming format where responses come as:
+  [{"candidates": [...]}, {"candidates": [...]}]
+
+Note: Gemini supports TWO streaming formats:
+1. JSON Array (alt=json) - Used by this test - Returns array of JSON objects
+2. SSE (alt=sse) - Server-Sent Events format - Returns "data: {...}" lines
+
+The Python SDK uses JSON array format by default.
+
 Tests verify spec compliance:
 - Correct chunk sequence
 - Proper content and tool handling
