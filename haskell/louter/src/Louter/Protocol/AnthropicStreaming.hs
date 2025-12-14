@@ -35,6 +35,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Vector as V
 import qualified Network.HTTP.Client as HTTP
+import System.IO (hPutStrLn, stderr, hFlush)
 
 -- ============================================================================
 -- State Types
@@ -186,9 +187,18 @@ processAnthropicChoice write flush state choice _openAIChunk = do
 
       -- Handle finish_reason
       finalState <- case finishReason of
-        Just "tool_calls" ->
+        Just "tool_calls" -> do
+          -- Close text block if open before emitting tool calls
+          stateAfterText <- if anthropicContentBlockStarted newState
+            then do
+              let idx = anthropicCurrentIndex newState
+              write (byteString $ BS8.pack $ "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":" ++ show idx ++ "}\n\n")
+              flush
+              -- Increment index after closing text block
+              pure newState { anthropicContentBlockStarted = False, anthropicCurrentIndex = anthropicCurrentIndex newState + 1 }
+            else pure newState
           -- Emit buffered tool calls
-          emitAnthropicToolCalls write flush newState
+          emitAnthropicToolCalls write flush stateAfterText
 
         Just _ ->
           -- Close text content block if open
@@ -197,7 +207,8 @@ processAnthropicChoice write flush state choice _openAIChunk = do
               let idx = anthropicCurrentIndex newState
               write (byteString $ BS8.pack $ "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":" ++ show idx ++ "}\n\n")
               flush
-              pure newState { anthropicContentBlockStarted = False }
+              -- Increment index after closing text block
+              pure newState { anthropicContentBlockStarted = False, anthropicCurrentIndex = anthropicCurrentIndex newState + 1 }
             else pure newState
 
         Nothing -> pure newState
@@ -265,6 +276,12 @@ emitAnthropicToolCalls write flush state = do
   forM_ sortedToolCalls $ \(tcIndex, tcState) -> do
     case (anthropicToolCallId tcState, anthropicToolCallName tcState) of
       (Just toolId, Just toolName) -> do
+        -- Log tool call for debugging
+        hPutStrLn stderr $ "[Anthropic] Emitting tool_use: id=" <> T.unpack toolId
+                <> ", name=" <> T.unpack toolName
+                <> ", args=" <> T.unpack (anthropicToolCallArgs tcState)
+        hFlush stderr
+
         -- Parse arguments as JSON
         let argsJson = case eitherDecode (BL.fromStrict $ TE.encodeUtf8 (anthropicToolCallArgs tcState)) of
               Right val -> val
@@ -274,6 +291,7 @@ emitAnthropicToolCalls write flush state = do
         let blockIndex = anthropicCurrentIndex state + tcIndex
 
         -- Send content_block_start
+        -- IMPORTANT: tool_use content_block must include empty input object
         let startEvent = object
               [ "type" .= ("content_block_start" :: Text)
               , "index" .= blockIndex
@@ -281,18 +299,20 @@ emitAnthropicToolCalls write flush state = do
                   [ "type" .= ("tool_use" :: Text)
                   , "id" .= toolId
                   , "name" .= toolName
+                  , "input" .= object []  -- Empty input object required by Anthropic spec
                   ]
               ]
         write (byteString $ BS8.pack "event: content_block_start\ndata: " <> BL.toStrict (encode startEvent) <> BS8.pack "\n\n")
         flush
 
         -- Send input_json_delta
+        -- partial_json should be the raw JSON string, not re-encoded
         let deltaEvent = object
               [ "type" .= ("content_block_delta" :: Text)
               , "index" .= blockIndex
               , "delta" .= object
                   [ "type" .= ("input_json_delta" :: Text)
-                  , "partial_json" .= TE.decodeUtf8 (BL.toStrict $ encode argsJson)
+                  , "partial_json" .= anthropicToolCallArgs tcState
                   ]
               ]
         write (byteString $ BS8.pack "event: content_block_delta\ndata: " <> BL.toStrict (encode deltaEvent) <> BS8.pack "\n\n")

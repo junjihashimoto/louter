@@ -41,11 +41,13 @@ import Louter.Client (Client, Backend(..), newClient, chatCompletion, streamChat
 import Louter.Client.OpenAI (llamaServerClient)
 import Louter.Types.Request (ChatRequest(..), Message(..), MessageRole(..), Tool(..), ToolChoice(..))
 import Louter.Types.Streaming (StreamEvent(..))
+import Louter.Types.ToolFormat (XMLToolCallState, initialXMLState)
 import Louter.Protocol.AnthropicConverter
 import Louter.Protocol.AnthropicStreaming
 import Louter.Protocol.GeminiConverter
 import Louter.Protocol.GeminiStreaming
 import Louter.Protocol.GeminiStreamingJsonArray
+import Louter.Streaming.XMLStreamProcessor (processXMLStream, finalizeXMLState)
 import Louter.Backend.OpenAIToAnthropic
 import Louter.Backend.OpenAIToGemini
 
@@ -81,6 +83,7 @@ data BackendConfig = BackendConfig
   , backendApiKey :: Maybe Text
   , backendRequiresAuth :: Bool
   , backendModelMapping :: Map Text Text  -- frontend model -> backend model
+  , backendToolFormat :: Text  -- "json" (default) or "xml" (Qwen3-Coder)
   } deriving (Show)
 
 -- | CLI parser
@@ -115,6 +118,7 @@ main = do
                 , backendApiKey = Nothing
                 , backendRequiresAuth = False
                 , backendModelMapping = Map.empty
+                , backendToolFormat = "json"  -- Default to JSON format
                 })]
         }
 
@@ -322,6 +326,9 @@ handleOpenAIStreamingToOpenAI state backendCfg openAIReq respond = do
         , HTTP.requestHeaders = [("Content-Type", "application/json")]
         }
 
+  -- Check if backend uses XML tool format (Qwen3-Coder)
+  let usesXML = backendToolFormat backendCfg == "xml"
+
   let sseResponse = responseStream status200
         [ ("Content-Type", "text/event-stream")
         , ("Cache-Control", "no-cache")
@@ -329,17 +336,45 @@ handleOpenAIStreamingToOpenAI state backendCfg openAIReq respond = do
         ] $ \write flush -> do
           withResponse req' (appManager state) $ \backendResp -> do
             let body = HTTP.responseBody backendResp
-            let loop = do
-                  chunk <- brRead body
-                  if BS.null chunk
-                    then pure ()
-                    else do
-                      write (byteString chunk)
-                      flush
-                      loop
-            loop
+            if usesXML
+              then streamWithXMLProcessing write flush body
+              else streamPassThrough write flush body
 
   respond sseResponse
+  where
+    -- Pass-through streaming (no XML processing)
+    streamPassThrough write flush body = do
+      let loop = do
+            chunk <- brRead body
+            if BS.null chunk
+              then pure ()
+              else do
+                write (byteString chunk)
+                flush
+                loop
+      loop
+
+    -- XML processing streaming (buffer and convert tool calls)
+    streamWithXMLProcessing write flush body = do
+      let loop xmlState = do
+            chunk <- brRead body
+            if BS.null chunk
+              then do
+                -- End of stream - finalize XML state
+                let finalEvents = finalizeXMLState xmlState
+                forM_ finalEvents $ \event -> do
+                  write (byteString $ eventToSSE event)
+                  flush
+              else do
+                -- Process chunk through XML parser
+                let chunkText = TE.decodeUtf8 chunk
+                let (newState, events) = processXMLStream xmlState chunkText
+                -- Emit converted events as OpenAI SSE
+                forM_ events $ \event -> do
+                  write (byteString $ eventToSSE event)
+                  flush
+                loop newState
+      loop initialXMLState
 
 -- ==============================================================================
 -- OpenAI Frontend → Anthropic Backend (Requires Conversion)
