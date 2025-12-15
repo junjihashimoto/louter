@@ -706,15 +706,28 @@ parseTools = mapM parseTool
 -- | /v1/messages - Anthropic endpoint
 anthropicMessagesHandler :: AppState -> Application
 anthropicMessagesHandler state req respond = do
+  -- Generate trace ID
+  traceId <- generateTraceId
+
   -- Read request body
   body <- strictRequestBody req
 
   case eitherDecode body of
-    Left err -> respond $ responseLBS status400
-      [("Content-Type", "application/json")]
-      (encode $ object ["error" .= ("Invalid Anthropic request: " <> T.pack err :: Text)])
+    Left err -> do
+      logEvent traceId "anthropic_parse_error" $ object
+        [ "error" .= T.pack err
+        , "body_preview" .= T.take 500 (TE.decodeUtf8 (BL.toStrict body))
+        ]
+      respond $ responseLBS status400
+        [("Content-Type", "application/json")]
+        (encode $ object ["error" .= ("Invalid Anthropic request: " <> T.pack err :: Text)])
 
     Right anthropicReq -> do
+      -- Log the full Anthropic request
+      logEvent traceId "anthropic_request" $ object
+        [ "request" .= anthropicReq
+        ]
+
       -- Get first backend (for now - TODO: support backend selection via model name)
       case Map.toList (configBackends $ appConfig state) of
         [] -> respond $ responseLBS status500
@@ -726,8 +739,8 @@ anthropicMessagesHandler state req respond = do
           let isStreaming = getAnthropicStreamFlag anthropicReq
 
           if isStreaming
-            then handleAnthropicStreaming state backendCfg anthropicReq respond
-            else handleAnthropicNonStreaming state backendCfg anthropicReq respond
+            then handleAnthropicStreaming traceId state backendCfg anthropicReq respond
+            else handleAnthropicNonStreaming traceId state backendCfg anthropicReq respond
 
 -- | Get Anthropic stream flag
 getAnthropicStreamFlag :: Value -> Bool
@@ -737,8 +750,8 @@ getAnthropicStreamFlag (Object obj) = case HM.lookup "stream" obj of
 getAnthropicStreamFlag _ = False
 
 -- | Handle Anthropic streaming request
-handleAnthropicStreaming :: AppState -> BackendConfig -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
-handleAnthropicStreaming state backendCfg anthropicReq respond = do
+handleAnthropicStreaming :: Text -> AppState -> BackendConfig -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
+handleAnthropicStreaming traceId state backendCfg anthropicReq respond = do
   -- Convert Anthropic request to OpenAI format
   case anthropicToOpenAI anthropicReq of
     Left err -> respond $ responseLBS status400
@@ -769,8 +782,8 @@ handleAnthropicStreaming state backendCfg anthropicReq respond = do
       respond sseResponse
 
 -- | Handle Anthropic non-streaming request
-handleAnthropicNonStreaming :: AppState -> BackendConfig -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
-handleAnthropicNonStreaming state backendCfg anthropicReq respond = do
+handleAnthropicNonStreaming :: Text -> AppState -> BackendConfig -> Value -> (Response -> IO ResponseReceived) -> IO ResponseReceived
+handleAnthropicNonStreaming traceId state backendCfg anthropicReq respond = do
   case anthropicToOpenAI anthropicReq of
     Left err -> respond $ responseLBS status400
       [("Content-Type", "application/json")]
