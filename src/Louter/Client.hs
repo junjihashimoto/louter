@@ -267,11 +267,19 @@ parseOpenAIChoice (Object choice) = do
     Just (Number n) -> Right (floor n)
     _ -> Right 0
 
-  message <- case HM.lookup "message" choice of
-    Just (Object msg) -> case HM.lookup "content" msg of
-      Just (String txt) -> Right txt
-      _ -> Right ""
-    _ -> Right ""
+  (message, toolCalls) <- case HM.lookup "message" choice of
+    Just (Object msg) -> do
+      let content = case HM.lookup "content" msg of
+            Just (String txt) -> txt
+            Just Null -> ""
+            _ -> ""
+
+      tools <- case HM.lookup "tool_calls" msg of
+        Just (Array arr) -> mapM parseToolCall (V.toList arr)
+        _ -> Right []
+
+      Right (content, tools)
+    _ -> Right ("", [])
 
   let finishReason = case HM.lookup "finish_reason" choice of
         Just (String "stop") -> Just FinishStop
@@ -279,9 +287,37 @@ parseOpenAIChoice (Object choice) = do
         Just (String "tool_calls") -> Just FinishToolCalls
         _ -> Nothing
 
-  pure $ Choice index message finishReason
+  pure $ Choice index message toolCalls finishReason
 
 parseOpenAIChoice _ = Left "Expected choice object"
+
+-- | Parse a tool call from OpenAI format
+parseToolCall :: Value -> Either String ResponseToolCall
+parseToolCall (Object obj) = do
+  tcId <- case HM.lookup "id" obj of
+    Just (String i) -> Right i
+    _ -> Left "Missing tool call id"
+
+  tcType <- case HM.lookup "type" obj of
+    Just (String t) -> Right t
+    _ -> Right "function"
+
+  tcFunction <- case HM.lookup "function" obj of
+    Just (Object func) -> do
+      name <- case HM.lookup "name" func of
+        Just (String n) -> Right n
+        _ -> Left "Missing function name"
+
+      args <- case HM.lookup "arguments" func of
+        Just (String a) -> Right a
+        _ -> Right ""
+
+      Right $ FunctionCall name args
+    _ -> Left "Missing function object"
+
+  pure $ ResponseToolCall tcId tcType tcFunction
+
+parseToolCall _ = Left "Expected tool call object"
 
 -- | Parse Anthropic format response (uses converter)
 parseAnthropicResponse :: BL.ByteString -> Either String ChatResponse
