@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 -- | High-level client API for Louter
 -- This module uses the same proven converters as the proxy server
@@ -45,6 +46,7 @@ import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BL
 import Data.Conduit ((.|), runConduit, ConduitT, yield, await)
 import qualified Data.Conduit.List as CL
+import qualified Data.HashMap.Strict as HMS
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -103,19 +105,174 @@ chatCompletion client req = do
         Left err -> pure $ Left $ "Failed to parse response: " <> T.pack err
         Right resp -> pure $ Right resp
 
+-- | Parse SSE stream from HTTP response
+parseSSEStream :: Manager -> Request -> ConduitT () StreamEvent IO ()
+parseSSEStream manager httpReq = do
+  -- We need to lift the withResponse into the Conduit monad
+  -- The trick is to use bracket-style resource management
+  response <- liftIO $ responseOpen httpReq manager
+  parseSSEChunks (responseBody response)
+  liftIO $ responseClose response
+
+-- | Parse SSE chunks from body reader
+parseSSEChunks :: BodyReader -> ConduitT () StreamEvent IO ()
+parseSSEChunks bodyReader = loop BS.empty HMS.empty
+  where
+    loop acc toolCallState = do
+      chunk <- liftIO $ brRead bodyReader
+      if BS.null chunk
+        then do
+          -- End of stream - emit any buffered tool calls
+          mapM_ emitToolCall (HMS.toList toolCallState)
+        else do
+          let combined = acc <> chunk
+              lines' = BS8.split '\n' combined
+          case lines' of
+            [] -> loop BS.empty toolCallState
+            [incomplete] -> loop incomplete toolCallState
+            _ -> do
+              let (completeLines, rest) = (init lines', last lines')
+              newState <- foldM processSSELine toolCallState completeLines
+              loop rest newState
+
+    processSSELine state line
+      | BS.isPrefixOf "data: " line = do
+          let jsonText = TE.decodeUtf8 $ BS.drop 6 line
+          if jsonText == "[DONE]"
+            then do
+              -- Emit all buffered tool calls and finish
+              mapM_ emitToolCall (HMS.toList state)
+              yield (StreamFinish "stop")
+              pure HMS.empty
+            else case eitherDecode (BL.fromStrict $ TE.encodeUtf8 jsonText) of
+              Right (Object chunk) -> processChunk state chunk
+              Left err -> do
+                yield (StreamError $ "Failed to parse JSON: " <> T.pack err)
+                pure state
+              _ -> pure state
+      | otherwise = pure state
+
+    processChunk state chunk = do
+      case HM.lookup "choices" chunk of
+        Just (Array choices) | not (V.null choices) -> do
+          case V.head choices of
+            Object choice -> processChoice state choice
+            _ -> pure state
+        _ -> pure state
+
+    processChoice state choice = do
+      case HM.lookup "delta" choice of
+        Just (Object delta) -> do
+          -- Handle content
+          newState1 <- case HM.lookup "content" delta of
+            Just (String content) -> do
+              yield (StreamContent content)
+              pure state
+            _ -> pure state
+
+          -- Handle reasoning (o1 models)
+          newState2 <- case HM.lookup "reasoning" delta of
+            Just (String reasoning) -> do
+              yield (StreamReasoning reasoning)
+              pure newState1
+            _ -> pure newState1
+
+          -- Handle tool calls (need buffering)
+          case HM.lookup "tool_calls" delta of
+            Just (Array toolCalls) -> processToolCalls newState2 toolCalls
+            _ -> pure newState2
+        _ -> pure state
+
+    processToolCalls state toolCalls = do
+      V.foldM processToolCallDelta state toolCalls
+
+    processToolCallDelta state (Object tcDelta) = do
+      case HM.lookup "index" tcDelta of
+        Just (Number idx) -> do
+          let index = floor idx :: Int
+          let existingTC = HMS.lookupDefault emptyToolCallState index state
+
+          -- Update tool call state
+          let updatedTC = existingTC
+                { tcId = case HM.lookup "id" tcDelta of
+                    Just (String id') -> Just id'
+                    _ -> tcId existingTC
+                , tcName = case HM.lookup "function" tcDelta >>= getFunctionName of
+                    Just name -> Just name
+                    _ -> tcName existingTC
+                , tcArgs = tcArgs existingTC <> case HM.lookup "function" tcDelta >>= getFunctionArgs of
+                    Just args -> args
+                    _ -> ""
+                }
+
+          -- Check if JSON is complete
+          if isCompleteJSON (tcArgs updatedTC) && isJust (tcId updatedTC) && isJust (tcName updatedTC)
+            then do
+              -- Emit complete tool call
+              emitToolCall (index, updatedTC)
+              pure $ HMS.delete index state
+            else
+              pure $ HMS.insert index updatedTC state
+        _ -> pure state
+    processToolCallDelta state _ = pure state
+
+    getFunctionName (Object func) = case HM.lookup "name" func of
+      Just (String name) -> Just name
+      _ -> Nothing
+    getFunctionName _ = Nothing
+
+    getFunctionArgs (Object func) = case HM.lookup "arguments" func of
+      Just (String args) -> Just args
+      _ -> Nothing
+    getFunctionArgs _ = Nothing
+
+    emptyToolCallState = ToolCallBufferState Nothing Nothing ""
+
+    emitToolCall (_, ToolCallBufferState (Just id') (Just name) args) = do
+      case eitherDecode (BL.fromStrict $ TE.encodeUtf8 args) of
+        Right argsValue -> yield (StreamToolCall $ ToolCall id' name argsValue)
+        Left _ -> pure ()  -- Malformed JSON, skip
+    emitToolCall _ = pure ()
+
+    isCompleteJSON txt =
+      let trimmed = T.strip txt
+      in not (T.null trimmed)
+         && T.head trimmed == '{'
+         && T.last trimmed == '}'
+         && case eitherDecode (BL.fromStrict $ TE.encodeUtf8 txt) of
+              Right (_ :: Value) -> True
+              Left _ -> False
+
+-- | Tool call buffer state
+data ToolCallBufferState = ToolCallBufferState
+  { tcId :: Maybe Text
+  , tcName :: Maybe Text
+  , tcArgs :: Text
+  } deriving (Show)
+
+isJust :: Maybe a -> Bool
+isJust (Just _) = True
+isJust Nothing = False
+
 -- | Streaming chat with conduit
 streamChat :: Client -> ChatRequest -> ConduitT () StreamEvent IO ()
 streamChat client req = do
   let req' = req { reqStream = True }
-  -- For now, just make the request and parse simple events
-  -- TODO: Implement proper streaming when we have tested server-side streaming
-  result <- liftIO $ makeRequest client req'
-  case result of
+  let backend = clientBackend client
+
+  -- Convert ChatRequest to backend-specific format
+  case convertRequestToBackend backend req' of
     Left err -> yield (StreamError err)
-    Right _respBody -> do
-      -- Placeholder: just return a finish event
-      -- Real implementation would parse SSE stream
-      yield (StreamFinish "stop")
+    Right (url, body, headers) -> do
+      httpReq <- liftIO $ parseRequest (T.unpack url)
+      let httpReq' = httpReq
+            { method = "POST"
+            , requestBody = RequestBodyLBS body
+            , requestHeaders = headers
+            }
+
+      -- Make streaming request and pipe to parseSSEStream
+      parseSSEStream (clientManager client) httpReq'
 
 -- | Type alias for streaming callbacks
 type StreamCallback = StreamEvent -> IO ()
