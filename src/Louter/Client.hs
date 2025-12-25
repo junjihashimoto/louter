@@ -51,10 +51,13 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Vector as V
+import Debug.Trace (trace)
 import Network.HTTP.Client
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import Network.HTTP.Types (hContentType, hAuthorization)
 import Network.HTTP.Types.Header (RequestHeaders)
+import System.Environment (lookupEnv)
+import System.IO.Unsafe (unsafePerformIO)
 
 -- Import server-side converters (proven, tested code)
 import Louter.Protocol.AnthropicConverter
@@ -62,6 +65,24 @@ import Louter.Protocol.GeminiConverter
 import Louter.Types.Request
 import Louter.Types.Response
 import Louter.Types.Streaming
+
+-- | Check if debug mode is enabled via LOUTER_DEBUG environment variable
+-- Set LOUTER_DEBUG=1 or LOUTER_DEBUG=true to enable debug logging
+{-# NOINLINE isDebugEnabled #-}
+isDebugEnabled :: Bool
+isDebugEnabled = unsafePerformIO $ do
+  maybeDebug <- lookupEnv "LOUTER_DEBUG"
+  pure $ case maybeDebug of
+    Just "1" -> True
+    Just "true" -> True
+    Just "TRUE" -> True
+    Just "yes" -> True
+    Just "YES" -> True
+    _ -> False
+
+-- | Conditional debug trace - only traces if LOUTER_DEBUG is set
+debugTrace :: String -> a -> a
+debugTrace msg x = if isDebugEnabled then trace msg x else x
 
 -- | Client configuration
 data Client = Client
@@ -291,6 +312,11 @@ makeRequest Client{..} chatReq = do
   case convertRequestToBackend backend chatReq of
     Left err -> pure $ Left err
     Right (url, body, headers) -> do
+      -- Debug logging (only if LOUTER_DEBUG is set)
+      debugTrace ("DEBUG: Request URL: " <> T.unpack url) $ return ()
+      debugTrace ("DEBUG: Request headers: " <> show headers) $ return ()
+      debugTrace ("DEBUG: Request body (first 500 bytes): " <> show (BL.take 500 body)) $ return ()
+
       req <- parseRequest (T.unpack url)
       let req' = req
             { method = "POST"
@@ -299,6 +325,8 @@ makeRequest Client{..} chatReq = do
             }
 
       response <- httpLbs req' clientManager
+      debugTrace ("DEBUG: Response status: " <> show (responseStatus response)) $ return ()
+      debugTrace ("DEBUG: Response headers: " <> show (responseHeaders response)) $ return ()
       pure $ Right $ responseBody response
 
 -- | Convert ChatRequest to backend-specific format
@@ -358,10 +386,45 @@ convertRequestToBackend backend chatReq =
       Right (url, requestBody, headers)
 
     BackendGemini{..} -> do
-      let url = case backendBaseUrl of
-            Just u -> u <> "/v1beta/models/" <> reqModel chatReq <> ":generateContent"
-            Nothing -> "https://generativelanguage.googleapis.com/v1beta/models/"
-                      <> reqModel chatReq <> ":generateContent"
+      let baseUrl = case backendBaseUrl of
+            Just u -> u
+            Nothing -> "https://generativelanguage.googleapis.com"
+
+          -- Construct URL path based on endpoint type
+          -- Different endpoints use different URL structures:
+          -- - generativelanguage.googleapis.com: /v1beta/models/{model}:generateContent
+          -- - aiplatform.googleapis.com: /v1/publishers/google/models/{model}:generateContent
+          -- - {region}-aiplatform.googleapis.com: /v1/publishers/google/models/{model}:generateContent
+          baseUrlWithPath = if T.isInfixOf "generativelanguage.googleapis.com" baseUrl
+                           then baseUrl <> "/v1beta/models/" <> reqModel chatReq <> ":generateContent"
+                           else if T.isInfixOf "aiplatform.googleapis.com" baseUrl
+                           then baseUrl <> "/v1/publishers/google/models/" <> reqModel chatReq <> ":generateContent"
+                           else baseUrl <> "/v1beta/models/" <> reqModel chatReq <> ":generateContent"  -- default
+
+          -- Determine authentication method based on endpoint
+          -- Three methods:
+          -- 1. Query parameter: aiplatform.googleapis.com?key=API_KEY
+          -- 2. Bearer token: ${LOCATION}-aiplatform.googleapis.com with Authorization header
+          -- 3. API key header: generativelanguage.googleapis.com with x-goog-api-key header
+          (finalUrl, authHeaders) = if backendRequiresAuth
+            then
+              if T.isInfixOf "generativelanguage.googleapis.com" baseUrl
+              then
+                -- Method 3: x-goog-api-key header for generativelanguage.googleapis.com
+                (baseUrlWithPath, [("x-goog-api-key", TE.encodeUtf8 backendApiKey)])
+              else if T.isInfixOf "-aiplatform.googleapis.com" baseUrl
+              then
+                -- Method 2: Authorization Bearer for region-specific endpoints (e.g., us-central1-aiplatform.googleapis.com)
+                (baseUrlWithPath, [(hAuthorization, TE.encodeUtf8 $ "Bearer " <> backendApiKey)])
+              else if T.isInfixOf "aiplatform.googleapis.com" baseUrl
+              then
+                -- Method 1: Query parameter for aiplatform.googleapis.com
+                (baseUrlWithPath <> "?key=" <> backendApiKey, [])
+              else
+                -- Default to x-goog-api-key for unknown endpoints
+                (baseUrlWithPath, [("x-goog-api-key", TE.encodeUtf8 backendApiKey)])
+            else
+              (baseUrlWithPath, [])
 
       -- Convert to Gemini format (reverse of what geminiToOpenAI does)
       let geminiContents = map chatMessageToGemini (reqMessages chatReq)
@@ -379,12 +442,9 @@ convertRequestToBackend backend chatReq =
                    Just m -> ["generationConfig" .= object ["maxOutputTokens" .= m]]
                    Nothing -> [])
 
-          headers = [(hContentType, "application/json")]
-                 ++ if backendRequiresAuth
-                    then [(hAuthorization, TE.encodeUtf8 $ "Bearer " <> backendApiKey)]
-                    else []
+          headers = [(hContentType, "application/json")] ++ authHeaders
 
-      Right (url, requestBody, headers)
+      Right (finalUrl, requestBody, headers)
 
 -- | Parse backend response into ChatResponse
 parseBackendResponse :: Backend -> BL.ByteString -> Either String ChatResponse
@@ -485,14 +545,118 @@ parseAnthropicResponse body = do
     Left err -> Left (T.unpack err)
     Right openAIFormat -> parseOpenAIResponse (encode openAIFormat)
 
--- | Parse Gemini format response (uses converter)
+-- | Parse Gemini format response
+-- Gemini response format: {"candidates": [{"content": {"role": "model", "parts": [{"text": "..."}]}}]}
 parseGeminiResponse :: BL.ByteString -> Either String ChatResponse
 parseGeminiResponse body = do
+  -- Debug logging (only if LOUTER_DEBUG is set)
+  let bodyPreview = BL.take 1000 body
+  debugTrace ("DEBUG: Gemini response body (first 1000 bytes): " <> show bodyPreview) $ return ()
+  debugTrace ("DEBUG: Gemini response body length: " <> show (BL.length body)) $ return ()
+
   obj <- eitherDecode body
-  -- Use geminiToOpenAI converter, then parse as OpenAI
-  case geminiToOpenAI "unknown" False obj of  -- False = non-streaming
-    Left err -> Left (T.unpack err)
-    Right openAIFormat -> parseOpenAIResponse (encode openAIFormat)
+  case obj of
+    Object o -> do
+      -- Extract model (optional)
+      let model = case HM.lookup "modelVersion" o of
+            Just (String m) -> m
+            _ -> "unknown"
+
+      -- Extract candidates array
+      candidates <- case HM.lookup "candidates" o of
+        Just (Array cs) -> Right $ V.toList cs
+        _ -> Left $ "Missing 'candidates' field in Gemini response. Available fields: "
+                 <> show (HM.keys o) <> ". Response body: " <> show (BL.take 500 body)
+
+      -- Parse each candidate as a choice
+      choices <- mapM (parseGeminiCandidate model) (zip [0..] candidates)
+
+      -- Extract usage metadata if present
+      let usage = case HM.lookup "usageMetadata" o of
+            Just (Object u) -> Just $ Usage
+              { usagePromptTokens = case HM.lookup "promptTokenCount" u of
+                  Just (Number n) -> floor n
+                  _ -> 0
+              , usageCompletionTokens = case HM.lookup "candidatesTokenCount" u of
+                  Just (Number n) -> floor n
+                  _ -> 0
+              , usageTotalTokens = case HM.lookup "totalTokenCount" u of
+                  Just (Number n) -> floor n
+                  _ -> 0
+              }
+            _ -> Nothing
+
+      -- Extract response ID (optional)
+      let respId = case HM.lookup "responseId" o of
+            Just (String i) -> i
+            _ -> "unknown"
+
+      Right $ ChatResponse respId model choices usage
+
+    _ -> Left "Expected JSON object for Gemini response"
+
+-- Parse a single Gemini candidate into a Choice
+parseGeminiCandidate :: Text -> (Int, Value) -> Either String Choice
+parseGeminiCandidate model (index, Object candidate) = do
+  -- Extract content object
+  content <- case HM.lookup "content" candidate of
+    Just (Object c) -> Right c
+    _ -> Left "Missing 'content' in candidate"
+
+  -- Extract parts array
+  parts <- case HM.lookup "parts" content of
+    Just (Array ps) -> Right $ V.toList ps
+    _ -> Left "Missing 'parts' in content"
+
+  -- Extract text from parts and function calls
+  let (texts, functionCalls) = extractGeminiParts parts
+
+  -- Combine all text parts
+  let messageText = T.intercalate " " texts
+
+  -- Parse finish reason
+  finishReason <- case HM.lookup "finishReason" candidate of
+    Just (String "STOP") -> Right $ Just FinishStop
+    Just (String "MAX_TOKENS") -> Right $ Just FinishLength
+    Just (String "SAFETY") -> Right $ Just FinishContentFilter
+    _ -> Right Nothing
+
+  Right $ Choice
+    { choiceIndex = index
+    , choiceMessage = messageText
+    , choiceToolCalls = functionCalls
+    , choiceFinishReason = finishReason
+    }
+parseGeminiCandidate _ (_, _) = Left "Expected object for candidate"
+
+-- Extract text and function calls from Gemini parts
+extractGeminiParts :: [Value] -> ([Text], [ResponseToolCall])
+extractGeminiParts parts =
+  let texts = [txt | Object part <- parts
+                    , Just (String txt) <- [HM.lookup "text" part]]
+
+      functionCalls = [call | Object part <- parts
+                             , Just call <- [parseGeminiFunctionCall part]]
+  in (texts, functionCalls)
+
+-- Parse a Gemini function call part
+parseGeminiFunctionCall :: HM.KeyMap Value -> Maybe ResponseToolCall
+parseGeminiFunctionCall part = do
+  Object funcCall <- HM.lookup "functionCall" part
+  String name <- HM.lookup "name" funcCall
+  args <- HM.lookup "args" funcCall
+
+  -- Generate an ID (Gemini doesn't provide one)
+  let callId = "call_" <> name
+
+  -- Encode args as proper JSON string
+  let argsJson = TE.decodeUtf8 $ BL.toStrict $ encode args
+
+  Just $ ResponseToolCall
+    { rtcId = callId
+    , rtcType = "function"
+    , rtcFunction = FunctionCall name argsJson
+    }
 
 -- Helper conversions for Anthropic
 chatMessageToAnthropic :: Message -> Value
@@ -514,11 +678,22 @@ chatMessageToGemini msg =
         RoleAssistant -> "model"
         RoleUser -> "user"
         _ -> "user"  -- Default for system/tool
-      parts = [object ["text" .= msgContent msg]]
+      -- Convert each ContentPart to Gemini part format
+      parts = map contentPartToGemini (msgContent msg)
   in object
       [ "role" .= (role :: Text)
       , "parts" .= parts
       ]
+
+-- Convert ContentPart to Gemini part format
+contentPartToGemini :: ContentPart -> Value
+contentPartToGemini (TextPart txt) = object ["text" .= txt]
+contentPartToGemini (ImagePart mediaType imageData) = object
+  [ "inline_data" .= object
+      [ "mime_type" .= mediaType
+      , "data" .= imageData
+      ]
+  ]
 
 chatToolToGemini :: Tool -> Value
 chatToolToGemini tool = object $
