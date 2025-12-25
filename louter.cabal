@@ -9,6 +9,7 @@ license: MIT
 license-file: LICENSE
 author: Junji Hashimoto
 maintainer: junji.hashimoto@gmail.com
+homepage: https://github.com/junjihashimoto/louter
 category: Web
 build-type: Simple
 
