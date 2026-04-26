@@ -38,7 +38,7 @@ module Louter.Client
 
 import Control.Monad (foldM)
 import Control.Monad.IO.Class (liftIO)
-import Data.Aeson (Value(..), encode, eitherDecode, object, (.=))
+import Data.Aeson (Value(..), encode, eitherDecode, object, toJSON, (.=))
 import qualified Data.Aeson.KeyMap as HM
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -358,9 +358,16 @@ convertRequestToBackend backend chatReq =
             Nothing -> "https://api.openai.com/v1/chat/completions"
 
           -- Build OpenAI request format
+
+          -- CloudTemple is a little restrictive here.
+          messageContent :: [ContentPart] -> Value
+          messageContent parts = case parts of
+                                   [TextPart text] -> String text
+                                   _               -> toJSON parts
+
           messagesJson = map (\msg -> object
             [ "role" .= msgRole msg
-            , "content" .= msgContent msg
+            , "content" .= messageContent (msgContent msg)
             ]) (reqMessages chatReq)
 
           requestBody = encode $ object
