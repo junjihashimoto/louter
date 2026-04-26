@@ -359,7 +359,7 @@ convertRequestToBackend backend chatReq =
 
           -- Build OpenAI request format
 
-          -- CloudTemple is a little restrictive here.
+          -- Serialise as ```content: "quoted text here"```, rather than ```content: [{"type":"text", "text":"quoted text here"}]```
           messageContent :: [ContentPart] -> Value
           messageContent parts = case parts of
                                    [TextPart text] -> String text
@@ -370,14 +370,16 @@ convertRequestToBackend backend chatReq =
             , "content" .= messageContent (msgContent msg)
             ]) (reqMessages chatReq)
 
-          requestBody = encode $ object
+          -- Do not serialize empty members.
+          requestBody = encode $ object $
             [ "model" .= reqModel chatReq
             , "messages" .= messagesJson
-            , "tools" .= if null (reqTools chatReq) then Nothing else Just (reqTools chatReq)
-            , "temperature" .= reqTemperature chatReq
-            , "max_tokens" .= reqMaxTokens chatReq
             , "stream" .= reqStream chatReq
             ]
+            <> if null (reqTools chatReq) then [] else ["tools" .= reqTools chatReq]
+            <> if null (reqTemperature chatReq) then [] else ["temperature".= reqTemperature chatReq]
+            <> if null (reqMaxTokens chatReq) then [] else ["max_tokens" .= reqMaxTokens chatReq]
+
 
           headers = [(hContentType, "application/json")]
                  ++ if backendRequiresAuth
