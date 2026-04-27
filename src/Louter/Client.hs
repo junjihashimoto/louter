@@ -108,6 +108,24 @@ data Backend
       , backendRequiresAuth :: Bool
       }
 
+-- | Show instances, for debugging.
+instance Show Backend where
+  show (BackendOpenAI _ backendBaseURL backendAuthRequired) =
+    "BackendOpenAI" <>
+      "{ backendBaseURL = " <> show backendBaseURL <>
+      ", backendRequiresAuth = " <> show backendAuthRequired <>
+      ", backendApiKey = <redacted> }"
+  show (BackendGemini _ backendBaseURL backendAuthRequired) =
+    "BackendGemini" <>
+      "{ backendBaseURL = " <> show backendBaseURL <>
+      ", backendRequiresAuth = " <> show backendAuthRequired <>
+      ", backendApiKey = <redacted> }"
+  show (BackendOpenAI _ backendBaseURL backendAuthRequired) =
+    "BackendAnthropic" <>
+      "{ backendBaseURL = " <> show backendBaseURL <>
+      ", backendRequiresAuth = " <> show backendAuthRequired <>
+      ", backendApiKey = <redacted> }"
+
 -- | Create a new client
 newClient :: Backend -> IO Client
 newClient backend = do
