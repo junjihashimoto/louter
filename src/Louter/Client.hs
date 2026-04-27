@@ -24,6 +24,7 @@ module Louter.Client
     Client
   , Backend(..)
   , newClient
+  , newClientWithTimeout
     -- * Simple API
   , chatCompletion
   , streamChat
@@ -130,6 +131,16 @@ instance Show Backend where
 newClient :: Backend -> IO Client
 newClient backend = do
   manager <- newManager tlsManagerSettings
+  pure $ Client manager backend
+
+-- | Create a new client, with a set timeout.
+newClientWithTimeout :: Maybe Int -> Backend -> IO Client
+newClientWithTimeout timeout backend = do
+  let settings =
+        case timeout of
+          Nothing -> tlsManagerSettings
+          Just seconds -> tlsManagerSettings { managerResponseTimeout = responseTimeoutMicro (seconds * 1000000) }
+  manager <- newManager settings
   pure $ Client manager backend
 
 -- | Non-streaming chat completion
