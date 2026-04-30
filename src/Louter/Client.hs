@@ -24,6 +24,7 @@ module Louter.Client
     Client
   , Backend(..)
   , newClient
+  , newClientWithTimeout
     -- * Simple API
   , chatCompletion
   , streamChat
@@ -38,7 +39,7 @@ module Louter.Client
 
 import Control.Monad (foldM)
 import Control.Monad.IO.Class (liftIO)
-import Data.Aeson (Value(..), encode, eitherDecode, object, (.=))
+import Data.Aeson (Value(..), encode, eitherDecode, object, toJSON, (.=))
 import qualified Data.Aeson.KeyMap as HM
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -130,6 +131,16 @@ instance Show Backend where
 newClient :: Backend -> IO Client
 newClient backend = do
   manager <- newManager tlsManagerSettings
+  pure $ Client manager backend
+
+-- | Create a new client, with a set timeout.
+newClientWithTimeout :: Maybe Int -> Backend -> IO Client
+newClientWithTimeout timeout backend = do
+  let settings =
+        case timeout of
+          Nothing -> tlsManagerSettings
+          Just seconds -> tlsManagerSettings { managerResponseTimeout = responseTimeoutMicro (seconds * 1000000) }
+  manager <- newManager settings
   pure $ Client manager backend
 
 -- | Non-streaming chat completion
@@ -358,19 +369,28 @@ convertRequestToBackend backend chatReq =
             Nothing -> "https://api.openai.com/v1/chat/completions"
 
           -- Build OpenAI request format
+
+          -- Serialise as ```content: "quoted text here"```, rather than ```content: [{"type":"text", "text":"quoted text here"}]```
+          messageContent :: [ContentPart] -> Value
+          messageContent parts = case parts of
+                                   [TextPart text] -> String text
+                                   _               -> toJSON parts
+
           messagesJson = map (\msg -> object
             [ "role" .= msgRole msg
-            , "content" .= msgContent msg
+            , "content" .= messageContent (msgContent msg)
             ]) (reqMessages chatReq)
 
-          requestBody = encode $ object
+          -- Do not serialize empty members.
+          requestBody = encode $ object $
             [ "model" .= reqModel chatReq
             , "messages" .= messagesJson
-            , "tools" .= if null (reqTools chatReq) then Nothing else Just (reqTools chatReq)
-            , "temperature" .= reqTemperature chatReq
-            , "max_tokens" .= reqMaxTokens chatReq
             , "stream" .= reqStream chatReq
             ]
+            <> if null (reqTools chatReq) then [] else ["tools" .= reqTools chatReq]
+            <> if null (reqTemperature chatReq) then [] else ["temperature".= reqTemperature chatReq]
+            <> if null (reqMaxTokens chatReq) then [] else ["max_tokens" .= reqMaxTokens chatReq]
+
 
           headers = [(hContentType, "application/json")]
                  ++ if backendRequiresAuth
