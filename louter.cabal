@@ -1,6 +1,6 @@
 cabal-version: 3.0
 name: louter
-version: 0.1.1.1
+version: 0.1.1.2
 synopsis: Multi-protocol LLM router and client library
 description: Protocol converter library that lets your application connect to any LLM API
              (OpenAI, Gemini, Anthropic) with automatic protocol translation, SSE streaming,
@@ -14,6 +14,7 @@ category: Web
 build-type: Simple
 
 extra-doc-files:    README.md
+                  , CHANGELOG.md
             
 library
   exposed-modules:
