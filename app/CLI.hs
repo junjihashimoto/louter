@@ -224,7 +224,7 @@ contentPartsToText parts = T.intercalate " " [txt | TextPart txt <- parts]
 handleMessage :: Text -> CLIState -> IO CLIState
 handleMessage userInput state@CLIState{..} = do
   let CLIConfig{..} = stateConfig
-      userMessage = Message RoleUser [TextPart userInput]
+      userMessage = Message RoleUser [TextPart userInput] [] Nothing
       newHistory = stateHistory ++ [userMessage]
 
       -- Build tools list from MCP tools
@@ -249,7 +249,7 @@ handleMessage userInput state@CLIState{..} = do
       -- Streaming response
       assistantContent <- handleStreamingResponse stateClient request
       TIO.putStrLn ""  -- Newline after streaming
-      let assistantMessage = Message RoleAssistant [TextPart assistantContent]
+      let assistantMessage = Message RoleAssistant [TextPart assistantContent] [] Nothing
       pure state { stateHistory = newHistory ++ [assistantMessage] }
     else do
       -- Non-streaming response
@@ -263,7 +263,7 @@ handleMessage userInput state@CLIState{..} = do
                 (choice:_) -> choiceMessage choice
                 [] -> ""
           TIO.putStrLn content
-          let assistantMessage = Message RoleAssistant [TextPart content]
+          let assistantMessage = Message RoleAssistant [TextPart content] [] Nothing
           pure state { stateHistory = newHistory ++ [assistantMessage] }
 
 -- | Handle streaming response

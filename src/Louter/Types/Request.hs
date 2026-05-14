@@ -1,6 +1,8 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE OverloadedStrings #-}
 
+{-# LANGUAGE LambdaCase #-}
+
 -- | Request types (Protocol-Agnostic Internal Representation)
 -- All protocol-specific requests convert TO this format
 module Louter.Types.Request
@@ -13,10 +15,10 @@ module Louter.Types.Request
   , defaultChatRequest
   ) where
 
-import Data.Aeson (FromJSON(..), ToJSON(..), Value(..), (.=), object)
+import Data.Aeson (FromJSON(..), ToJSON(..), Value(..), (.=), (.:), (.:?), object)
 import Data.Aeson.KeyMap (lookup)
 import Data.Text (Text)
-import qualified Data.Vector as V
+import qualified Data.Vector as V (toList)
 import GHC.Generics (Generic)
 import Prelude hiding (lookup)
 
@@ -85,28 +87,64 @@ instance FromJSON ContentPart where
 data Message = Message
   { msgRole :: !MessageRole
   , msgContent :: ![ContentPart]  -- ^ Changed from Text to [ContentPart]
+  , msgToolCalls :: ![MessageToolCall]
+  , msgToolCallId :: !(Maybe Text)
   } deriving (Show, Eq, Generic)
+
+data MessageToolCall = MessageToolCall
+  {
+    mtcId        :: !Text
+  , mtcName      :: !Text
+  , mtcArguments :: !Text
+  } deriving (Show, Eq, Generic)
+
+instance ToJSON MessageToolCall
+instance FromJSON MessageToolCall
 
 instance FromJSON Message where
   parseJSON (Object obj) = do
-    role <- case lookup "role" obj of
-      Just r -> parseJSON r
-      Nothing -> fail "Missing role"
-    content <- case lookup "content" obj of
-      -- Support both string and array format
-      Just (String txt) -> pure [TextPart txt]
-      Just (Array arr) -> mapM parseJSON (V.toList arr)
-      _ -> fail "Missing or invalid content"
-    pure $ Message role content
+    role <- obj .: "role"
+    content <- obj .:? "content" >>= \case
+      Nothing -> pure []
+      Just Null -> pure []
+      Just (String text) -> pure [TextPart text]
+      Just (Array arr) -> mapM parseJSON $ V.toList arr
+      Just other -> fail $ "Expected Array or String, got: " <> show other
+    toolCalls <- obj .:? "tool_calls" >>= \case
+      Nothing -> pure []
+      Just Null -> pure []
+      Just (Array arr) -> mapM parseJSON $ V.toList arr
+      Just other -> fail $ "Expected Array or String, got: " <> show other
+    toolCallId <- obj .:? "tool_call_id"
+    pure $ Message role content toolCalls toolCallId
   parseJSON _ = fail "Expected object for Message"
 
 instance ToJSON Message where
-  toJSON (Message role content) = object
-    [ "role" .= role
-    , "content" .= case content of
-        [TextPart txt] -> String txt  -- Simplify single text to string
-        parts -> toJSON parts         -- Multiple parts as array
-    ]
+  toJSON msg@(Message {})
+    | not (null $ msgToolCalls msg) =
+      object [ "role"       .= msgRole msg
+             , "content"    .= Null
+             , "tool_calls" .= map toToolCallJson (msgToolCalls msg)
+             ]
+    | Just toolCallID <- msgToolCallId msg =
+      object [ "role"         .= msgRole msg
+             , "content"      .= stringOrArray (msgContent msg)
+             , "tool_call_id" .= toolCallID
+             ]
+    | otherwise =
+      object [ "role"    .= msgRole msg
+             , "content" .= stringOrArray (msgContent msg)
+             ]
+    where
+      stringOrArray [TextPart text] = String text -- Simplify single text to string
+      stringOrArray parts = toJSON parts          -- Multiple parts as array
+      toToolCallJson toolCall =
+        object [ "id"       .= mtcId toolCall
+               , "type"     .= ("function" :: Text)
+               , "function" .= object [ "name"      .= mtcName toolCall
+                                      , "arguments" .= mtcArguments toolCall
+                                      ]
+               ]
 
 -- | Message role
 data MessageRole

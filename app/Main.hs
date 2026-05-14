@@ -670,7 +670,7 @@ parseMessages = mapM parseMessage
         Just (String c) -> Right [TextPart c]
         _ -> Left "Invalid or missing 'content' field"
 
-      Right Message { msgRole = role, msgContent = content }
+      Right (Message role content [] Nothing)
     parseMessage _ = Left "Message must be a JSON object"
 
 -- | Parse tools array
