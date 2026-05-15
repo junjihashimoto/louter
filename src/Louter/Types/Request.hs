@@ -71,6 +71,7 @@ instance ToJSON ContentPart where
         [ "url" .= ("data:" <> mediaType <> ";base64," <> dataB64)
         ]
     ]
+  toJSON v = error $ "Attempted to serialize type not supported: " <> show v <> "\n"
 
 instance FromJSON ContentPart where
   parseJSON (Object obj) = case lookup "type" obj of
