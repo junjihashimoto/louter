@@ -280,7 +280,8 @@ parseSSEChunks bodyReader = loop BS.empty (HMS.empty, "stop")
     emitToolCall (_, ToolCallBufferState (Just id') (Just name) args) = do
       case eitherDecode (BL.fromStrict $ TE.encodeUtf8 args) of
         Right argsValue -> yield (StreamToolCall $ ToolCall id' name argsValue)
-        Left _ -> pure ()  -- Malformed JSON, skip
+        Left err -> yield (StreamError $ "Tool JSON failed: " <> T.pack err <> " | args: " <> args)
+    emitToolCall (_, toolCallState) = yield (StreamError $ "Incomplete tool call: " <> T.pack (show toolCallState))
     emitToolCall _ = pure ()
 
     isCompleteJSON txt =
