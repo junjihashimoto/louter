@@ -211,7 +211,6 @@ parseSSEChunks bodyReader = loop BS.empty (HMS.empty, "stop")
         _ -> pure (toolCallState, finishReason)
 
     processChoice (toolCallState, lastFinishReason) choice = do
-      liftIO $ putStrLn $ "DEBUG choice: " <> show choice
       let finishReason = case HM.lookup "finish_reason" choice of
                            Just (String foundReason) | not (T.null foundReason) -> foundReason
                            _                                                    -> lastFinishReason
