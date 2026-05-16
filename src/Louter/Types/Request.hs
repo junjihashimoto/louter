@@ -15,7 +15,7 @@ module Louter.Types.Request
   , defaultChatRequest
   ) where
 
-import Data.Aeson (FromJSON(..), ToJSON(..), Value(..), (.=), (.:), (.:?), object)
+import Data.Aeson (FromJSON(..), ToJSON(..), Value(..), (.=), (.:), (.:?), object, withObject)
 import Data.Aeson.KeyMap (lookup)
 import Data.Text (Text)
 import qualified Data.Vector as V (toList)
